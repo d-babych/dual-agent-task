@@ -1,0 +1,19 @@
+[agents]
+spec_author = "claude"
+spec_reviewer = "codex"
+implementer = "codex"
+code_reviewer = "claude"
+
+[limits]
+max_spec_rounds = 3
+max_code_rounds = 3
+agent_timeout_seconds = 1200
+
+[git]
+require_clean_worktree = true
+allow_commits = false
+allow_push = false
+
+[verification]
+commands = ["git diff --check"]
+

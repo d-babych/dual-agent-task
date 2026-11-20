@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dual-agent-task"
+version = "0.1.0"
+description = "A small local orchestrator for collaborative Codex and Claude Code workflows."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [
+  { name = "dual-agent-task contributors" }
+]
+dependencies = []
+
+[project.scripts]
+dual-agent-task = "dual_agent_task.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+dual_agent_task = [
+  "assets/prompts/*.md",
+  "assets/schemas/*.json",
+  "assets/templates/*",
+]
+
