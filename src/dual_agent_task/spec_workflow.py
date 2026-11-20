@@ -66,6 +66,7 @@ def run_spec_workflow(
             timeout_seconds=config.limits.agent_timeout_seconds,
             model=config.models.spec_author,
             effort=config.effort.spec_author,
+            raw_output_path=run_directory / f"claude-author-{round_number:02d}.raw.json",
         )
         _validate_author_result(author_result)
         if stable_slug is None:

@@ -140,6 +140,16 @@ dual-agent-task task approve /path/to/project/tasks/my-feature.md
 Команда `task approve` є обов'язковим людським checkpoint. `plan` ніколи не
 запускає реалізацію самостійно.
 
+Якщо task уже сформульований і погоджений поза harness, його можна прийняти без
+повторного запуску planning-агентів:
+
+```bash
+dual-agent-task task adopt existing-task.md --project /path/to/project
+```
+
+Команда створює approved-копію в `tasks/`, зберігає посилання на початковий
+файл і не змінює його зміст. Сам `implement` автоматично не запускається.
+
 ### 2. Виконання підтвердженої задачі
 
 Запускається окремою командою:
@@ -161,6 +171,32 @@ dual-agent-task implement \
 
 Успішний результат має статус `ready_for_human_review`. Harness не створює
 commit: після перевірки ви робите його самостійно.
+
+Якщо реалізація вже є у working tree, але попередній запуск перервався на
+verification або review, продовжуйте без повторного першого запуску implementer-а:
+
+```bash
+dual-agent-task implement \
+  --resume-review \
+  --project /path/to/project \
+  tasks/my-feature.md
+```
+
+Перший раунд такого запуску зберігає поточний diff, повторює verification і
+починає з read-only review. Codex отримає керування лише якщо reviewer запросить
+зміни.
+
+Якщо Claude review завершився, але harness не зміг розібрати structured output,
+відновіть той самий run без повторного виклику агентів:
+
+```bash
+dual-agent-task recover-review \
+  --project /path/to/project \
+  /path/to/project/.dual-agent-task/runs/<run>-implement
+```
+
+Recovery дозволений лише коли поточний diff побайтово збігається з diff, який
+бачив reviewer, і всі verification-логи містять exit code 0.
 
 ## Розробка
 

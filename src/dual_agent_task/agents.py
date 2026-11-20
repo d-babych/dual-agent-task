@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 from typing import Any, Optional
 
@@ -18,6 +19,7 @@ def run_claude_structured(
     tools: tuple[str, ...] = (),
     model: Optional[str] = None,
     effort: Optional[str] = None,
+    raw_output_path: Optional[Path] = None,
 ) -> dict[str, Any]:
     schema = json.loads(schema_path.read_text(encoding="utf-8"))
     command = (
@@ -35,7 +37,10 @@ def run_claude_structured(
         "--no-session-persistence",
     )
     result = _run(command, prompt, project_root, timeout_seconds)
-    return _extract_claude_structured_output(result.stdout)
+    if raw_output_path is not None:
+        raw_output_path.write_text(result.stdout, encoding="utf-8")
+    required = tuple(str(key) for key in schema.get("required", []))
+    return _extract_claude_structured_output(result.stdout, required_keys=required)
 
 
 def run_codex_structured(
@@ -96,15 +101,15 @@ def _run_codex_structured(
     model: Optional[str],
     effort: Optional[str],
 ) -> dict[str, Any]:
-    approval_arguments = ("--approve-for-me",) if approve_for_me else ()
     command = (
         "codex",
         "exec",
         *_codex_runtime_arguments(model=model, effort=effort),
         "--ephemeral",
-        "--sandbox",
-        sandbox,
-        *approval_arguments,
+        *_codex_permission_arguments(
+            sandbox=sandbox,
+            approve_for_me=approve_for_me,
+        ),
         "--output-schema",
         str(schema_path),
         "--output-last-message",
@@ -145,6 +150,16 @@ def _codex_runtime_arguments(
     return tuple(arguments)
 
 
+def _codex_permission_arguments(
+    *, sandbox: str, approve_for_me: bool
+) -> tuple[str, ...]:
+    if approve_for_me:
+        # In Codex CLI, --approve-for-me already selects the workspace-write
+        # sandbox and conflicts with an explicit --sandbox argument.
+        return ("--approve-for-me",)
+    return ("--sandbox", sandbox)
+
+
 def _run(
     command: tuple[str, ...],
     prompt: str,
@@ -179,33 +194,124 @@ def _run(
     return result
 
 
-def _extract_claude_structured_output(stdout: str) -> dict[str, Any]:
+def _extract_claude_structured_output(
+    stdout: str, *, required_keys: tuple[str, ...] = ()
+) -> dict[str, Any]:
     try:
         envelope = json.loads(stdout)
     except json.JSONDecodeError as error:
         raise HarnessError(f"Claude returned invalid JSON: {error}") from error
 
-    candidates: list[Any] = []
-    if isinstance(envelope, dict):
-        candidates.extend(
-            (
-                envelope.get("structured_output"),
-                envelope.get("result"),
-                envelope,
-            )
+    structured = _find_structured_object(envelope, required_keys=required_keys)
+    if structured is not None:
+        return structured
+    if isinstance(envelope, dict) and isinstance(envelope.get("result"), str):
+        review = _parse_prose_review(
+            envelope["result"],
+            required_keys=required_keys,
         )
-    else:
-        candidates.append(envelope)
+        if review is not None:
+            return review
+    keys = sorted(envelope.keys()) if isinstance(envelope, dict) else []
+    raise HarnessError(
+        "Claude response did not contain the required structured object; "
+        f"required={list(required_keys)}, envelope_keys={keys}"
+    )
 
-    for candidate in candidates:
-        if isinstance(candidate, dict):
-            return candidate
-        if isinstance(candidate, str):
+
+def _find_structured_object(
+    value: Any, *, required_keys: tuple[str, ...]
+) -> Optional[dict[str, Any]]:
+    if isinstance(value, dict):
+        if required_keys and all(key in value for key in required_keys):
+            return value
+        preferred = ("structured_output", "result", "response", "data", "content")
+        for key in preferred:
+            if key in value:
+                found = _find_structured_object(value[key], required_keys=required_keys)
+                if found is not None:
+                    return found
+        if not required_keys and not {"type", "subtype", "session_id"}.intersection(value):
+            return value
+        for key, nested in value.items():
+            if key not in preferred:
+                found = _find_structured_object(nested, required_keys=required_keys)
+                if found is not None:
+                    return found
+        return None
+    if isinstance(value, list):
+        for item in value:
+            found = _find_structured_object(item, required_keys=required_keys)
+            if found is not None:
+                return found
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if text.startswith("```") and text.endswith("```"):
+            lines = text.splitlines()
+            text = "\n".join(lines[1:-1]).strip()
+        candidates = [text]
+        first_brace = text.find("{")
+        last_brace = text.rfind("}")
+        if first_brace >= 0 and last_brace > first_brace:
+            candidates.append(text[first_brace : last_brace + 1])
+        for candidate in candidates:
             try:
                 parsed = json.loads(candidate)
             except json.JSONDecodeError:
                 continue
-            if isinstance(parsed, dict):
-                return parsed
-    raise HarnessError("Claude response did not contain a structured JSON object")
+            found = _find_structured_object(parsed, required_keys=required_keys)
+            if found is not None:
+                return found
+    return None
+
+
+def _parse_prose_review(
+    text: str, *, required_keys: tuple[str, ...]
+) -> Optional[dict[str, Any]]:
+    review_keys = {"verdict", "summary", "findings", "verification_assessment"}
+    if not review_keys.issubset(set(required_keys)):
+        return None
+    match = re.search(
+        r"(?im)verdict\s*:\s*[`*_\s]*(approved|changes_requested|needs_user_input)",
+        text,
+    )
+    if match is None:
+        return None
+    verdict = match.group(1).lower()
+    summary = _first_prose_summary(text, match.end())
+    findings: list[dict[str, Any]] = []
+    if verdict != "approved":
+        findings.append(
+            {
+                "id": "CLAUDE-REVIEW-1",
+                "severity": "blocking",
+                "path": None,
+                "line": None,
+                "issue": text.strip(),
+                "expected_fix": "Address the reviewer feedback in full.",
+            }
+        )
+    verification_line = next(
+        (
+            line.strip()
+            for line in text.splitlines()
+            if "build passed" in line.lower() or "verification" in line.lower()
+        ),
+        "See the prose review summary.",
+    )
+    return {
+        "verdict": verdict,
+        "summary": summary,
+        "findings": findings,
+        "verification_assessment": verification_line,
+    }
+
+
+def _first_prose_summary(text: str, start: int) -> str:
+    for line in text[start:].splitlines():
+        candidate = line.strip().strip("#-* `_\t")
+        if candidate and candidate.lower() not in {"review findings", "findings"}:
+            return candidate
+    return "Claude completed a prose code review."
 

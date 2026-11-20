@@ -5,10 +5,12 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 from typing import Callable
 
 from dual_agent_task.agents import (
+    _extract_claude_structured_output,
     run_claude_structured,
     run_codex_write_structured,
 )
@@ -39,11 +41,105 @@ class ImplementationOutcome:
     run_directory: Path
 
 
+def recover_implementation_review(
+    *, config: HarnessConfig, run_directory: Path
+) -> ImplementationOutcome:
+    run_path = run_directory.expanduser().resolve()
+    if not run_path.is_dir():
+        raise HarnessError(f"Run directory does not exist: {run_path}")
+
+    raw_files = sorted(run_path.glob("claude-review-*.raw.json"))
+    if not raw_files:
+        raise HarnessError(f"No raw Claude review found in {run_path}")
+    raw_path = raw_files[-1]
+    match = re.search(r"claude-review-(\d+)\.raw\.json$", raw_path.name)
+    if match is None:
+        raise HarnessError(f"Cannot determine review round from {raw_path.name}")
+    round_number = int(match.group(1))
+
+    captured_diff_path = run_path / f"changes-{round_number:02d}.diff"
+    if not captured_diff_path.is_file():
+        raise HarnessError(f"Captured diff is missing: {captured_diff_path}")
+    captured_diff = captured_diff_path.read_text(encoding="utf-8")
+    current_diff = _git(
+        config.project_root,
+        "diff",
+        "--no-ext-diff",
+        "--binary",
+        "HEAD",
+        "--",
+    )
+    if current_diff != captured_diff:
+        raise HarnessError(
+            "The working tree changed after Claude reviewed it; recovery would be stale. "
+            "Run `implement --resume-review` instead."
+        )
+
+    schema = json.loads(
+        (config.schemas_directory / "code-review.schema.json").read_text(encoding="utf-8")
+    )
+    required = tuple(str(key) for key in schema.get("required", []))
+    review = _extract_claude_structured_output(
+        raw_path.read_text(encoding="utf-8"),
+        required_keys=required,
+    )
+    _validate_code_review(review)
+
+    verification_logs = sorted(
+        run_path.glob(f"verification-{round_number:02d}-*.log")
+    )
+    if not verification_logs:
+        raise HarnessError("No verification logs found for the reviewed round")
+    exit_codes = [_verification_log_exit_code(path) for path in verification_logs]
+    checks_passed = all(code == 0 for code in exit_codes)
+
+    verdict = str(review["verdict"])
+    if verdict == "approved" and checks_passed:
+        status = "ready_for_human_review"
+    elif verdict == "needs_user_input":
+        status = "needs_user_input"
+    elif verdict == "changes_requested":
+        status = "changes_requested"
+    else:
+        status = "review_incomplete"
+
+    _write_json(run_path / f"code-review-{round_number:02d}.json", review)
+    _write_json(
+        run_path / "result.json",
+        {
+            "status": status,
+            "rounds": round_number,
+            "recovered_from_raw_review": True,
+            "verification_exit_codes": exit_codes,
+            "runtimes": {
+                "code_reviewer": {
+                    "agent": config.agents.code_reviewer,
+                    "model": config.models.code_reviewer,
+                    "effort": config.effort.code_reviewer,
+                }
+            },
+        },
+    )
+    return ImplementationOutcome(
+        status=status,
+        rounds=round_number,
+        run_directory=run_path,
+    )
+
+
+def _verification_log_exit_code(path: Path) -> int:
+    match = re.search(r"(?m)^exit:\s*(\d+)\s*$", path.read_text(encoding="utf-8"))
+    if match is None:
+        raise HarnessError(f"Verification log has no exit code: {path}")
+    return int(match.group(1))
+
+
 def run_implementation_workflow(
     *,
     config: HarnessConfig,
     task_path: Path,
     report: Reporter = print,
+    resume_review: bool = False,
 ) -> ImplementationOutcome:
     if config.agents.implementer != "codex" or config.agents.code_reviewer != "claude":
         raise HarnessError(
@@ -63,7 +159,7 @@ def run_implementation_workflow(
         raise HarnessError("Implementation requires a task with status `approved`")
 
     base_head = _git(config.project_root, "rev-parse", "HEAD").strip()
-    if config.git.require_clean_worktree:
+    if config.git.require_clean_worktree and not resume_review:
         _require_clean_worktree(config.project_root, resolved_task)
 
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ-implement")
@@ -85,28 +181,41 @@ def run_implementation_workflow(
 
     for round_number in range(1, config.limits.max_code_rounds + 1):
         rounds_completed = round_number
-        report(
-            f"[{round_number}/{config.limits.max_code_rounds}] Codex is implementing "
-            f"({_runtime_label(config.models.implementer, config.effort.implementer)})..."
-        )
-        implementer_prompt = _render_prompt(
-            implementer_template,
-            PROJECT_RULES=rules,
-            APPROVED_TASK=approved_task,
-            LATEST_REVIEW=latest_review,
-            VERIFICATION_RESULTS=latest_verification,
-        )
-        implementer_output = run_directory / f"implementer-{round_number:02d}.json"
-        implementation_result = run_codex_write_structured(
-            prompt=implementer_prompt,
-            schema_path=implementation_schema,
-            output_path=implementer_output,
-            project_root=config.project_root,
-            timeout_seconds=config.limits.agent_timeout_seconds,
-            model=config.models.implementer,
-            effort=config.effort.implementer,
-        )
-        _assert_head_unchanged(config.project_root, base_head)
+        if resume_review and round_number == 1:
+            report(
+                f"[{round_number}/{config.limits.max_code_rounds}] Resuming with the "
+                "existing working tree; skipping Codex implementation..."
+            )
+            implementation_result = {
+                "summary": "Resumed from an existing implementation after a reviewer parsing failure.",
+                "tests_run": [],
+                "remaining_risks": [
+                    "The prior implementer summary is available in the previous run."
+                ],
+            }
+        else:
+            report(
+                f"[{round_number}/{config.limits.max_code_rounds}] Codex is implementing "
+                f"({_runtime_label(config.models.implementer, config.effort.implementer)})..."
+            )
+            implementer_prompt = _render_prompt(
+                implementer_template,
+                PROJECT_RULES=rules,
+                APPROVED_TASK=approved_task,
+                LATEST_REVIEW=latest_review,
+                VERIFICATION_RESULTS=latest_verification,
+            )
+            implementer_output = run_directory / f"implementer-{round_number:02d}.json"
+            implementation_result = run_codex_write_structured(
+                prompt=implementer_prompt,
+                schema_path=implementation_schema,
+                output_path=implementer_output,
+                project_root=config.project_root,
+                timeout_seconds=config.limits.agent_timeout_seconds,
+                model=config.models.implementer,
+                effort=config.effort.implementer,
+            )
+            _assert_head_unchanged(config.project_root, base_head)
 
         report(f"[{round_number}/{config.limits.max_code_rounds}] Running verification...")
         verification = _run_verification(config, run_directory, round_number)
@@ -148,6 +257,7 @@ def run_implementation_workflow(
             tools=("Read", "Glob", "Grep"),
             model=config.models.code_reviewer,
             effort=config.effort.code_reviewer,
+            raw_output_path=run_directory / f"claude-review-{round_number:02d}.raw.json",
         )
         _validate_code_review(review)
         _write_json(run_directory / f"code-review-{round_number:02d}.json", review)

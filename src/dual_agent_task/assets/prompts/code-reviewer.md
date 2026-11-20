@@ -9,6 +9,11 @@ Use `approved` only when the implementation satisfies the task and there are no
 blocking findings. Use `needs_user_input` only for a decision that cannot safely
 be made from the approved task. Otherwise use `changes_requested`.
 
+Your final response must be a JSON object with exactly these top-level keys:
+`verdict`, `summary`, `findings`, and `verification_assessment`. Do not wrap the
+JSON in Markdown and do not add prose before or after it, even if structured
+output enforcement is unavailable.
+
 ## Project rules
 
 {{PROJECT_RULES}}

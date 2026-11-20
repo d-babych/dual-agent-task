@@ -3,7 +3,12 @@ import tempfile
 import unittest
 
 from dual_agent_task.errors import HarnessError
-from dual_agent_task.task_file import approve_task, read_status, render_task
+from dual_agent_task.task_file import (
+    adopt_approved_task,
+    approve_task,
+    read_status,
+    render_task,
+)
 
 
 class TaskFileTests(unittest.TestCase):
@@ -39,6 +44,22 @@ class TaskFileTests(unittest.TestCase):
 
             with self.assertRaises(HarnessError):
                 approve_task(path)
+
+    def test_adopt_creates_approved_managed_copy_without_changing_source(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            source = root / "Floorball-Handball-task.md"
+            source.write_text("# Existing task\n\nKeep this content.\n", encoding="utf-8")
+
+            target = adopt_approved_task(source=source, project_root=root)
+
+            self.assertEqual(target, root / "tasks" / "floorball-handball.md")
+            self.assertEqual(read_status(target), "approved")
+            self.assertIn("# Existing task", target.read_text(encoding="utf-8"))
+            self.assertEqual(
+                source.read_text(encoding="utf-8"),
+                "# Existing task\n\nKeep this content.\n",
+            )
 
 
 if __name__ == "__main__":

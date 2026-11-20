@@ -7,10 +7,13 @@ import sys
 from dual_agent_task import __version__
 from dual_agent_task.config import HarnessConfig
 from dual_agent_task.errors import HarnessError
-from dual_agent_task.implementation_workflow import run_implementation_workflow
+from dual_agent_task.implementation_workflow import (
+    recover_implementation_review,
+    run_implementation_workflow,
+)
 from dual_agent_task.project import initialize_project, run_doctor, upgrade_project
 from dual_agent_task.spec_workflow import run_spec_workflow
-from dual_agent_task.task_file import approve_task, read_status
+from dual_agent_task.task_file import adopt_approved_task, approve_task, read_status
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -52,7 +55,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     implement_parser.add_argument("task", type=Path)
     implement_parser.add_argument("--project", default=".")
+    implement_parser.add_argument(
+        "--resume-review",
+        action="store_true",
+        help="Keep current changes and resume from verification/review",
+    )
     implement_parser.set_defaults(handler=_handle_implement)
+
+    recover_parser = subparsers.add_parser(
+        "recover-review",
+        help="Recover a completed Claude review from a failed run without calling agents",
+    )
+    recover_parser.add_argument("run_directory", type=Path)
+    recover_parser.add_argument("--project", default=".")
+    recover_parser.set_defaults(handler=_handle_recover_review)
 
     task_parser = subparsers.add_parser("task", help="Inspect or update task files")
     task_subparsers = task_parser.add_subparsers(dest="task_command", required=True)
@@ -64,6 +80,14 @@ def build_parser() -> argparse.ArgumentParser:
     approve_parser = task_subparsers.add_parser("approve", help="Approve a reviewed task")
     approve_parser.add_argument("path", type=Path)
     approve_parser.set_defaults(handler=_handle_task_approve)
+
+    adopt_parser = task_subparsers.add_parser(
+        "adopt", help="Import an already approved task without running planning agents"
+    )
+    adopt_parser.add_argument("source", type=Path)
+    adopt_parser.add_argument("--project", default=".")
+    adopt_parser.add_argument("--slug")
+    adopt_parser.set_defaults(handler=_handle_task_adopt)
 
     return parser
 
@@ -146,9 +170,24 @@ def _handle_implement(arguments: argparse.Namespace) -> int:
     outcome = run_implementation_workflow(
         config=config,
         task_path=arguments.task,
+        resume_review=arguments.resume_review,
     )
     print(f"Implementation status: {outcome.status}")
     print(f"Rounds: {outcome.rounds}")
+    print(f"Run artifacts: {outcome.run_directory}")
+    if outcome.status == "ready_for_human_review":
+        print("Review the working tree with `git status` and `git diff`, then commit manually.")
+        return 0
+    return 2
+
+
+def _handle_recover_review(arguments: argparse.Namespace) -> int:
+    config = HarnessConfig.load(Path(arguments.project))
+    outcome = recover_implementation_review(
+        config=config,
+        run_directory=arguments.run_directory,
+    )
+    print(f"Recovered review status: {outcome.status}")
     print(f"Run artifacts: {outcome.run_directory}")
     if outcome.status == "ready_for_human_review":
         print("Review the working tree with `git status` and `git diff`, then commit manually.")
@@ -169,6 +208,21 @@ def _handle_task_approve(arguments: argparse.Namespace) -> int:
     path = arguments.path.expanduser().resolve()
     approve_task(path)
     print(f"Approved: {path}")
+    return 0
+
+
+def _handle_task_adopt(arguments: argparse.Namespace) -> int:
+    path = adopt_approved_task(
+        source=arguments.source,
+        project_root=Path(arguments.project),
+        slug=arguments.slug,
+    )
+    print(f"Adopted approved task: {path}")
+    print(f"Status: {read_status(path)}")
+    print(
+        "Implement with: dual-agent-task implement "
+        f"--project {Path(arguments.project).expanduser().resolve()} {path}"
+    )
     return 0
 
 
