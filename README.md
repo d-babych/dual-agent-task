@@ -6,6 +6,7 @@
 Поточний MVP реалізує перший вертикальний зріз:
 
 - `init` — додає конфігурацію harness у наявний проєкт;
+- `upgrade` — додає нові секції та assets без перезапису локальних правил;
 - `doctor` — перевіряє Git, конфігурацію, CLI та авторизацію агентів;
 - `plan` — окремо запускає цикл author/reviewer і створює task-файл;
 - `implement` — окремо реалізує підтверджений task і запускає code review;
@@ -38,6 +39,10 @@ python3 -m venv .venv
 .venv/bin/dual-agent-task --help
 ```
 
+Пакування використовує `setup.py`, тому editable-install працює також зі
+штатним macOS `pip 21.2.4`; оновлювати pip і завантажувати build-залежності для
+цього не потрібно.
+
 Або без встановлення:
 
 ```bash
@@ -50,6 +55,16 @@ PYTHONPATH=src python3 -m dual_agent_task --help
 dual-agent-task init /path/to/project
 dual-agent-task doctor /path/to/project
 ```
+
+Оновлення вже ініціалізованого проєкту після оновлення самого harness:
+
+```bash
+dual-agent-task upgrade /path/to/project
+dual-agent-task doctor /path/to/project
+```
+
+`upgrade` не перезаписує `PROJECT_RULES.md`, існуючі промпти, схеми чи
+verification-команди. Він лише додає відсутні файли й конфігураційні секції.
 
 Команда `init` створить:
 
@@ -65,6 +80,28 @@ PROJECT_RULES.md
 
 Існуючі файли не перезаписуються. Промпти, схеми й конфігурацію варто комітити;
 `.dual-agent-task/runs/` містить локальні журнали запусків.
+
+## Моделі та effort
+
+Модель і effort задаються окремо для кожної ролі:
+
+```toml
+[models]
+spec_author = "sonnet"
+spec_reviewer = "gpt-5.6-sol"
+implementer = "gpt-5.6-sol"
+code_reviewer = "sonnet"
+
+[effort]
+spec_author = "high"
+spec_reviewer = "high"
+implementer = "medium"
+code_reviewer = "high"
+```
+
+Для Claude harness передає `--model` і `--effort`. Для Codex він передає
+`--model` та `--config model_reasoning_effort=...`. Якщо значення відсутнє,
+відповідний CLI використовує власний default.
 
 ## Два незалежні режими
 

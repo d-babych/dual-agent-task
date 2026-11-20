@@ -24,6 +24,20 @@ SCHEMA_FILES = (
     "code-review.schema.json",
 )
 
+MODEL_SECTION = """[models]
+spec_author = "sonnet"
+spec_reviewer = "gpt-5.6-sol"
+implementer = "gpt-5.6-sol"
+code_reviewer = "sonnet"
+"""
+
+EFFORT_SECTION = """[effort]
+spec_author = "high"
+spec_reviewer = "high"
+implementer = "medium"
+code_reviewer = "high"
+"""
+
 
 @dataclass(frozen=True)
 class CheckResult:
@@ -84,6 +98,29 @@ def initialize_project(project_root: Path) -> list[Path]:
     return written
 
 
+def upgrade_project(project_root: Path) -> list[Path]:
+    """Add missing harness assets and config sections without replacing custom files."""
+    root = project_root.expanduser().resolve()
+    changed = initialize_project(root)
+    config_path = root / CONFIG_DIRECTORY / "config.toml"
+    content = config_path.read_text(encoding="utf-8")
+    additions: list[str] = []
+    if "[models]" not in content:
+        additions.append(MODEL_SECTION)
+    if "[effort]" not in content:
+        additions.append(EFFORT_SECTION)
+    if additions:
+        separator = "" if content.endswith("\n\n") else "\n"
+        appended_sections = "\n".join(additions)
+        config_path.write_text(
+            f"{content}{separator}{appended_sections}",
+            encoding="utf-8",
+        )
+        if config_path not in changed:
+            changed.append(config_path)
+    return changed
+
+
 def run_doctor(project_root: Path) -> list[CheckResult]:
     root = project_root.expanduser().resolve()
     results: list[CheckResult] = []
@@ -98,6 +135,7 @@ def run_doctor(project_root: Path) -> list[CheckResult]:
         return results
 
     results.extend(_file_checks(config))
+    results.extend(_runtime_checks(config))
     results.extend(
         (
             _command_check("Codex CLI", "codex", ("--version",)),
@@ -107,6 +145,23 @@ def run_doctor(project_root: Path) -> list[CheckResult]:
         )
     )
     return results
+
+
+def _runtime_checks(config: HarnessConfig) -> Iterable[CheckResult]:
+    roles = (
+        ("spec_author", config.agents.spec_author),
+        ("spec_reviewer", config.agents.spec_reviewer),
+        ("implementer", config.agents.implementer),
+        ("code_reviewer", config.agents.code_reviewer),
+    )
+    for role, agent in roles:
+        model = getattr(config.models, role) or "CLI default"
+        effort = getattr(config.effort, role) or "CLI default"
+        yield CheckResult(
+            f"Runtime {role}",
+            True,
+            f"agent={agent}, model={model}, effort={effort}",
+        )
 
 
 def _write_if_missing(path: Path, content: str) -> list[Path]:
@@ -178,7 +233,22 @@ def _command_check(name: str, executable: str, arguments: tuple[str, ...]) -> Ch
     except subprocess.TimeoutExpired:
         return CheckResult(name, False, "command timed out")
 
-    output = (result.stdout or result.stderr).strip().splitlines()
-    detail = output[-1] if output else f"exit code {result.returncode}"
+    raw_output = (result.stdout or result.stderr).strip()
+    detail = _summarize_command_output(raw_output, result.returncode)
     return CheckResult(name, result.returncode == 0, detail)
+
+
+def _summarize_command_output(output: str, return_code: int) -> str:
+    if not output:
+        return f"exit code {return_code}"
+    try:
+        value = json.loads(output)
+    except json.JSONDecodeError:
+        return output.splitlines()[-1]
+    if isinstance(value, dict):
+        return ", ".join(
+            f"{key}={json.dumps(item, ensure_ascii=False)}"
+            for key, item in value.items()
+        )
+    return str(value)
 

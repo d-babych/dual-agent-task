@@ -4,7 +4,7 @@ import configparser
 from dataclasses import dataclass
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 try:
     import tomllib
@@ -27,6 +27,22 @@ class AgentConfig:
 
 
 @dataclass(frozen=True)
+class ModelConfig:
+    spec_author: Optional[str]
+    spec_reviewer: Optional[str]
+    implementer: Optional[str]
+    code_reviewer: Optional[str]
+
+
+@dataclass(frozen=True)
+class EffortConfig:
+    spec_author: Optional[str]
+    spec_reviewer: Optional[str]
+    implementer: Optional[str]
+    code_reviewer: Optional[str]
+
+
+@dataclass(frozen=True)
 class LimitConfig:
     max_spec_rounds: int
     max_code_rounds: int
@@ -44,6 +60,8 @@ class GitConfig:
 class HarnessConfig:
     project_root: Path
     agents: AgentConfig
+    models: ModelConfig
+    effort: EffortConfig
     limits: LimitConfig
     git: GitConfig
     verification_commands: tuple[str, ...]
@@ -76,6 +94,8 @@ class HarnessConfig:
         try:
             raw = _load_configuration(path)
             agents = raw["agents"]
+            models = raw.get("models", {})
+            effort = raw.get("effort", {})
             limits = raw["limits"]
             git = raw["git"]
             verification = raw.get("verification", {})
@@ -86,6 +106,18 @@ class HarnessConfig:
                     spec_reviewer=str(agents["spec_reviewer"]),
                     implementer=str(agents["implementer"]),
                     code_reviewer=str(agents["code_reviewer"]),
+                ),
+                models=ModelConfig(
+                    spec_author=_optional_string(models.get("spec_author")),
+                    spec_reviewer=_optional_string(models.get("spec_reviewer")),
+                    implementer=_optional_string(models.get("implementer")),
+                    code_reviewer=_optional_string(models.get("code_reviewer")),
+                ),
+                effort=EffortConfig(
+                    spec_author=_optional_string(effort.get("spec_author")),
+                    spec_reviewer=_optional_string(effort.get("spec_reviewer")),
+                    implementer=_optional_string(effort.get("implementer")),
+                    code_reviewer=_optional_string(effort.get("code_reviewer")),
                 ),
                 limits=LimitConfig(
                     max_spec_rounds=int(limits["max_spec_rounds"]),
@@ -110,8 +142,25 @@ class HarnessConfig:
             raise HarnessError("limits.max_code_rounds must be at least 1")
         if config.limits.agent_timeout_seconds < 1:
             raise HarnessError("limits.agent_timeout_seconds must be at least 1")
+        _validate_effort(config.effort)
 
         return config
+
+
+def _optional_string(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    string = str(value).strip()
+    return string or None
+
+
+def _validate_effort(effort: EffortConfig) -> None:
+    supported = {"low", "medium", "high", "xhigh", "max"}
+    for role in ("spec_author", "spec_reviewer", "implementer", "code_reviewer"):
+        value = getattr(effort, role)
+        if value is not None and value not in supported:
+            choices = ", ".join(sorted(supported))
+            raise HarnessError(f"effort.{role} must be one of: {choices}")
 
 
 def _load_configuration(path: Path) -> dict[str, Any]:

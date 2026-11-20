@@ -4,7 +4,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
-from typing import Any
+from typing import Any, Optional
 
 from dual_agent_task.errors import HarnessError
 
@@ -16,11 +16,14 @@ def run_claude_structured(
     project_root: Path,
     timeout_seconds: int,
     tools: tuple[str, ...] = (),
+    model: Optional[str] = None,
+    effort: Optional[str] = None,
 ) -> dict[str, Any]:
     schema = json.loads(schema_path.read_text(encoding="utf-8"))
     command = (
         "claude",
         "-p",
+        *_claude_runtime_arguments(model=model, effort=effort),
         "--output-format",
         "json",
         "--json-schema",
@@ -42,6 +45,8 @@ def run_codex_structured(
     output_path: Path,
     project_root: Path,
     timeout_seconds: int,
+    model: Optional[str] = None,
+    effort: Optional[str] = None,
 ) -> dict[str, Any]:
     return _run_codex_structured(
         prompt=prompt,
@@ -51,6 +56,8 @@ def run_codex_structured(
         timeout_seconds=timeout_seconds,
         sandbox="read-only",
         approve_for_me=False,
+        model=model,
+        effort=effort,
     )
 
 
@@ -61,6 +68,8 @@ def run_codex_write_structured(
     output_path: Path,
     project_root: Path,
     timeout_seconds: int,
+    model: Optional[str] = None,
+    effort: Optional[str] = None,
 ) -> dict[str, Any]:
     return _run_codex_structured(
         prompt=prompt,
@@ -70,6 +79,8 @@ def run_codex_write_structured(
         timeout_seconds=timeout_seconds,
         sandbox="workspace-write",
         approve_for_me=True,
+        model=model,
+        effort=effort,
     )
 
 
@@ -82,11 +93,14 @@ def _run_codex_structured(
     timeout_seconds: int,
     sandbox: str,
     approve_for_me: bool,
+    model: Optional[str],
+    effort: Optional[str],
 ) -> dict[str, Any]:
     approval_arguments = ("--approve-for-me",) if approve_for_me else ()
     command = (
         "codex",
         "exec",
+        *_codex_runtime_arguments(model=model, effort=effort),
         "--ephemeral",
         "--sandbox",
         sandbox,
@@ -107,6 +121,28 @@ def _run_codex_structured(
     if not isinstance(value, dict):
         raise HarnessError("Codex structured output must be a JSON object")
     return value
+
+
+def _claude_runtime_arguments(
+    *, model: Optional[str], effort: Optional[str]
+) -> tuple[str, ...]:
+    arguments: list[str] = []
+    if model:
+        arguments.extend(("--model", model))
+    if effort:
+        arguments.extend(("--effort", effort))
+    return tuple(arguments)
+
+
+def _codex_runtime_arguments(
+    *, model: Optional[str], effort: Optional[str]
+) -> tuple[str, ...]:
+    arguments: list[str] = []
+    if model:
+        arguments.extend(("--model", model))
+    if effort:
+        arguments.extend(("--config", f'model_reasoning_effort="{effort}"'))
+    return tuple(arguments)
 
 
 def _run(

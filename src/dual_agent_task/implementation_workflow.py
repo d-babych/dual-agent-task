@@ -85,7 +85,10 @@ def run_implementation_workflow(
 
     for round_number in range(1, config.limits.max_code_rounds + 1):
         rounds_completed = round_number
-        report(f"[{round_number}/{config.limits.max_code_rounds}] Codex is implementing...")
+        report(
+            f"[{round_number}/{config.limits.max_code_rounds}] Codex is implementing "
+            f"({_runtime_label(config.models.implementer, config.effort.implementer)})..."
+        )
         implementer_prompt = _render_prompt(
             implementer_template,
             PROJECT_RULES=rules,
@@ -100,6 +103,8 @@ def run_implementation_workflow(
             output_path=implementer_output,
             project_root=config.project_root,
             timeout_seconds=config.limits.agent_timeout_seconds,
+            model=config.models.implementer,
+            effort=config.effort.implementer,
         )
         _assert_head_unchanged(config.project_root, base_head)
 
@@ -120,7 +125,10 @@ def run_implementation_workflow(
             status, encoding="utf-8"
         )
 
-        report(f"[{round_number}/{config.limits.max_code_rounds}] Claude is reviewing...")
+        report(
+            f"[{round_number}/{config.limits.max_code_rounds}] Claude is reviewing "
+            f"({_runtime_label(config.models.code_reviewer, config.effort.code_reviewer)})..."
+        )
         reviewer_prompt = _render_prompt(
             reviewer_template,
             PROJECT_RULES=rules,
@@ -138,6 +146,8 @@ def run_implementation_workflow(
             project_root=config.project_root,
             timeout_seconds=config.limits.agent_timeout_seconds,
             tools=("Read", "Glob", "Grep"),
+            model=config.models.code_reviewer,
+            effort=config.effort.code_reviewer,
         )
         _validate_code_review(review)
         _write_json(run_directory / f"code-review-{round_number:02d}.json", review)
@@ -163,6 +173,18 @@ def run_implementation_workflow(
             "rounds": rounds_completed,
             "base_head": base_head,
             "task_path": str(resolved_task),
+            "runtimes": {
+                "implementer": {
+                    "agent": config.agents.implementer,
+                    "model": config.models.implementer,
+                    "effort": config.effort.implementer,
+                },
+                "code_reviewer": {
+                    "agent": config.agents.code_reviewer,
+                    "model": config.models.code_reviewer,
+                    "effort": config.effort.code_reviewer,
+                },
+            },
         },
     )
     return ImplementationOutcome(
@@ -170,6 +192,10 @@ def run_implementation_workflow(
         rounds=rounds_completed,
         run_directory=run_directory,
     )
+
+
+def _runtime_label(model: object, effort: object) -> str:
+    return f"model={model or 'CLI default'}, effort={effort or 'CLI default'}"
 
 
 def _run_verification(

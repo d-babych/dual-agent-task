@@ -8,7 +8,7 @@ from dual_agent_task import __version__
 from dual_agent_task.config import HarnessConfig
 from dual_agent_task.errors import HarnessError
 from dual_agent_task.implementation_workflow import run_implementation_workflow
-from dual_agent_task.project import initialize_project, run_doctor
+from dual_agent_task.project import initialize_project, run_doctor, upgrade_project
 from dual_agent_task.spec_workflow import run_spec_workflow
 from dual_agent_task.task_file import approve_task, read_status
 
@@ -24,6 +24,12 @@ def build_parser() -> argparse.ArgumentParser:
     init_parser = subparsers.add_parser("init", help="Initialize a project")
     init_parser.add_argument("project", nargs="?", default=".")
     init_parser.set_defaults(handler=_handle_init)
+
+    upgrade_parser = subparsers.add_parser(
+        "upgrade", help="Add missing harness config without overwriting custom project files"
+    )
+    upgrade_parser.add_argument("project", nargs="?", default=".")
+    upgrade_parser.set_defaults(handler=_handle_upgrade)
 
     doctor_parser = subparsers.add_parser("doctor", help="Check project setup")
     doctor_parser.add_argument("project", nargs="?", default=".")
@@ -94,6 +100,19 @@ def _handle_doctor(arguments: argparse.Namespace) -> int:
         marker = "✓" if result.passed else "✗"
         print(f"{marker} {result.name}: {result.detail}")
     return 0 if results and all(result.passed for result in results) else 1
+
+
+def _handle_upgrade(arguments: argparse.Namespace) -> int:
+    root = Path(arguments.project).expanduser().resolve()
+    changed = upgrade_project(root)
+    if changed:
+        print(f"Upgraded dual-agent-task configuration in {root}")
+        for path in changed:
+            print(f"  updated {path.relative_to(root)}")
+    else:
+        print(f"dual-agent-task configuration is already current in {root}")
+    print("Next: review config.toml, then run `dual-agent-task doctor`.")
+    return 0
 
 
 def _add_plan_arguments(parser: argparse.ArgumentParser) -> None:

@@ -48,7 +48,10 @@ def run_spec_workflow(
     final_status = "review_incomplete"
 
     for round_number in range(1, config.limits.max_spec_rounds + 1):
-        report(f"[{round_number}/{config.limits.max_spec_rounds}] Claude is drafting the task...")
+        report(
+            f"[{round_number}/{config.limits.max_spec_rounds}] Claude is drafting "
+            f"the task ({_runtime_label(config.models.spec_author, config.effort.spec_author)})..."
+        )
         author_prompt = _render_prompt(
             author_template,
             PROJECT_RULES=rules,
@@ -61,6 +64,8 @@ def run_spec_workflow(
             schema_path=task_schema,
             project_root=config.project_root,
             timeout_seconds=config.limits.agent_timeout_seconds,
+            model=config.models.spec_author,
+            effort=config.effort.spec_author,
         )
         _validate_author_result(author_result)
         if stable_slug is None:
@@ -77,7 +82,10 @@ def run_spec_workflow(
             f"{current_task}\n", encoding="utf-8"
         )
 
-        report(f"[{round_number}/{config.limits.max_spec_rounds}] Codex is reviewing the task...")
+        report(
+            f"[{round_number}/{config.limits.max_spec_rounds}] Codex is reviewing "
+            f"the task ({_runtime_label(config.models.spec_reviewer, config.effort.spec_reviewer)})..."
+        )
         reviewer_prompt = _render_prompt(
             reviewer_template,
             PROJECT_RULES=rules,
@@ -91,6 +99,8 @@ def run_spec_workflow(
             output_path=reviewer_output,
             project_root=config.project_root,
             timeout_seconds=config.limits.agent_timeout_seconds,
+            model=config.models.spec_reviewer,
+            effort=config.effort.spec_reviewer,
         )
         _validate_review(review)
         _write_json(run_directory / f"review-{round_number:02d}.json", review)
@@ -125,7 +135,22 @@ def run_spec_workflow(
     )
     (run_directory / "result.json").write_text(
         json.dumps(
-            {"status": final_status, "task_path": str(task_path)},
+            {
+                "status": final_status,
+                "task_path": str(task_path),
+                "runtimes": {
+                    "spec_author": {
+                        "agent": config.agents.spec_author,
+                        "model": config.models.spec_author,
+                        "effort": config.effort.spec_author,
+                    },
+                    "spec_reviewer": {
+                        "agent": config.agents.spec_reviewer,
+                        "model": config.models.spec_reviewer,
+                        "effort": config.effort.spec_reviewer,
+                    },
+                },
+            },
             ensure_ascii=False,
             indent=2,
         )
@@ -133,6 +158,10 @@ def run_spec_workflow(
         encoding="utf-8",
     )
     return task_path
+
+
+def _runtime_label(model: object, effort: object) -> str:
+    return f"model={model or 'CLI default'}, effort={effort or 'CLI default'}"
 
 
 def _render_prompt(template: str, **values: str) -> str:
