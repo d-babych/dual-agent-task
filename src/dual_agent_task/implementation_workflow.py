@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import time
 from typing import Callable
 
 from dual_agent_task.agents import (
@@ -16,6 +17,14 @@ from dual_agent_task.agents import (
 )
 from dual_agent_task.config import HarnessConfig
 from dual_agent_task.errors import HarnessError
+from dual_agent_task.process_runner import run_streaming_process
+from dual_agent_task.progress import (
+    CallbackProgress,
+    ProgressReporter,
+    compact,
+    format_duration,
+    summarize_verification_line,
+)
 from dual_agent_task.task_file import read_status
 
 
@@ -28,6 +37,7 @@ class VerificationResult:
     return_code: int
     stdout: str
     stderr: str
+    duration_seconds: float = 0.0
 
     @property
     def passed(self) -> bool:
@@ -140,7 +150,9 @@ def run_implementation_workflow(
     task_path: Path,
     report: Reporter = print,
     resume_review: bool = False,
+    progress: ProgressReporter | None = None,
 ) -> ImplementationOutcome:
+    output = progress or CallbackProgress(report)
     if config.agents.implementer != "codex" or config.agents.code_reviewer != "claude":
         raise HarnessError(
             "The MVP currently supports `codex` as implementer and `claude` "
@@ -182,9 +194,9 @@ def run_implementation_workflow(
     for round_number in range(1, config.limits.max_code_rounds + 1):
         rounds_completed = round_number
         if resume_review and round_number == 1:
-            report(
-                f"[{round_number}/{config.limits.max_code_rounds}] Resuming with the "
-                "existing working tree; skipping Codex implementation..."
+            output.info(
+                f"[{round_number}/{config.limits.max_code_rounds}] Resuming existing "
+                "working tree · skipping Codex implementation"
             )
             implementation_result = {
                 "summary": "Resumed from an existing implementation after a reviewer parsing failure.",
@@ -194,10 +206,11 @@ def run_implementation_workflow(
                 ],
             }
         else:
-            report(
-                f"[{round_number}/{config.limits.max_code_rounds}] Codex is implementing "
-                f"({_runtime_label(config.models.implementer, config.effort.implementer)})..."
+            output.start(
+                f"[{round_number}/{config.limits.max_code_rounds}] Codex implementing · "
+                f"{_runtime_label(config.models.implementer, config.effort.implementer)}"
             )
+            stage_started = time.monotonic()
             implementer_prompt = _render_prompt(
                 implementer_template,
                 PROJECT_RULES=rules,
@@ -206,19 +219,43 @@ def run_implementation_workflow(
                 VERIFICATION_RESULTS=latest_verification,
             )
             implementer_output = run_directory / f"implementer-{round_number:02d}.json"
-            implementation_result = run_codex_write_structured(
-                prompt=implementer_prompt,
-                schema_path=implementation_schema,
-                output_path=implementer_output,
-                project_root=config.project_root,
-                timeout_seconds=config.limits.agent_timeout_seconds,
-                model=config.models.implementer,
-                effort=config.effort.implementer,
-            )
+            try:
+                implementation_result = run_codex_write_structured(
+                    prompt=implementer_prompt,
+                    schema_path=implementation_schema,
+                    output_path=implementer_output,
+                    project_root=config.project_root,
+                    timeout_seconds=config.limits.agent_timeout_seconds,
+                    model=config.models.implementer,
+                    effort=config.effort.implementer,
+                    on_activity=output.activity,
+                    on_heartbeat=output.heartbeat,
+                    on_raw=output.raw,
+                    raw_output_path=run_directory
+                    / f"codex-implementer-{round_number:02d}.raw.jsonl",
+                )
+            except HarnessError as error:
+                output.finish(
+                    f"Codex failed · {format_duration(time.monotonic() - stage_started)}",
+                    passed=False,
+                )
+                raise HarnessError(
+                    f"{error}\nRun artifacts: {run_directory}"
+                ) from error
             _assert_head_unchanged(config.project_root, base_head)
+            changed_files = _changed_file_count(config.project_root)
+            output.finish(
+                f"Codex finished · {format_duration(time.monotonic() - stage_started)} · "
+                f"{changed_files} files changed"
+            )
 
-        report(f"[{round_number}/{config.limits.max_code_rounds}] Running verification...")
-        verification = _run_verification(config, run_directory, round_number)
+        verification = _run_verification(
+            config,
+            run_directory,
+            round_number,
+            progress=output,
+            total_rounds=config.limits.max_code_rounds,
+        )
         latest_verification = json.dumps(
             [asdict(result) | {"passed": result.passed} for result in verification],
             ensure_ascii=False,
@@ -234,10 +271,11 @@ def run_implementation_workflow(
             status, encoding="utf-8"
         )
 
-        report(
-            f"[{round_number}/{config.limits.max_code_rounds}] Claude is reviewing "
-            f"({_runtime_label(config.models.code_reviewer, config.effort.code_reviewer)})..."
+        output.start(
+            f"[{round_number}/{config.limits.max_code_rounds}] Claude reviewing · "
+            f"{_runtime_label(config.models.code_reviewer, config.effort.code_reviewer)}"
         )
+        review_started = time.monotonic()
         reviewer_prompt = _render_prompt(
             reviewer_template,
             PROJECT_RULES=rules,
@@ -249,23 +287,41 @@ def run_implementation_workflow(
             CURRENT_DIFF=diff or "No tracked diff is available. Inspect files from git status.",
             VERIFICATION_RESULTS=latest_verification,
         )
-        review = run_claude_structured(
-            prompt=reviewer_prompt,
-            schema_path=review_schema,
-            project_root=config.project_root,
-            timeout_seconds=config.limits.agent_timeout_seconds,
-            tools=("Read", "Glob", "Grep"),
-            model=config.models.code_reviewer,
-            effort=config.effort.code_reviewer,
-            raw_output_path=run_directory / f"claude-review-{round_number:02d}.raw.json",
-        )
+        try:
+            review = run_claude_structured(
+                prompt=reviewer_prompt,
+                schema_path=review_schema,
+                project_root=config.project_root,
+                timeout_seconds=config.limits.agent_timeout_seconds,
+                tools=("Read", "Glob", "Grep"),
+                model=config.models.code_reviewer,
+                effort=config.effort.code_reviewer,
+                raw_output_path=run_directory
+                / f"claude-review-{round_number:02d}.raw.json",
+                on_activity=output.activity,
+                on_heartbeat=output.heartbeat,
+                on_raw=output.raw,
+            )
+        except HarnessError as error:
+            output.finish(
+                f"Claude review failed · "
+                f"{format_duration(time.monotonic() - review_started)}",
+                passed=False,
+            )
+            raise HarnessError(
+                f"{error}\nRun artifacts: {run_directory}"
+            ) from error
         _validate_code_review(review)
         _write_json(run_directory / f"code-review-{round_number:02d}.json", review)
         latest_review = json.dumps(review, ensure_ascii=False, indent=2)
 
         all_checks_passed = all(result.passed for result in verification)
         verdict = str(review["verdict"])
-        report(f"Claude verdict: {verdict}")
+        output.finish(
+            f"Review finished · {verdict} · "
+            f"{format_duration(time.monotonic() - review_started)}",
+            passed=verdict == "approved",
+        )
         if verdict == "approved" and all_checks_passed:
             final_status = "ready_for_human_review"
             break
@@ -305,31 +361,46 @@ def run_implementation_workflow(
 
 
 def _runtime_label(model: object, effort: object) -> str:
-    return f"model={model or 'CLI default'}, effort={effort or 'CLI default'}"
+    return f"{model or 'CLI default'}/{effort or 'CLI default'}"
 
 
 def _run_verification(
     config: HarnessConfig,
     run_directory: Path,
     round_number: int,
+    *,
+    progress: ProgressReporter,
+    total_rounds: int,
 ) -> list[VerificationResult]:
     results: list[VerificationResult] = []
+    total_commands = len(config.verification_commands)
     for index, command in enumerate(config.verification_commands, start=1):
+        progress.start(
+            f"[{round_number}/{total_rounds}] Verification {index}/{total_commands} · "
+            f"{compact(command)}"
+        )
+
+        def handle_line(source: str, line: str) -> None:
+            progress.raw(source, line)
+            summary = summarize_verification_line(line)
+            if summary is not None:
+                progress.activity(summary)
+
         try:
-            completed = subprocess.run(
+            completed = run_streaming_process(
                 ("/bin/zsh", "-lc", command),
                 cwd=config.project_root,
-                capture_output=True,
-                text=True,
-                timeout=config.limits.agent_timeout_seconds,
-                env=os.environ.copy(),
-                check=False,
+                timeout_seconds=config.limits.agent_timeout_seconds,
+                environment=os.environ.copy(),
+                on_line=handle_line,
+                on_heartbeat=progress.heartbeat,
             )
             result = VerificationResult(
                 command=command,
-                return_code=completed.returncode,
+                return_code=completed.return_code,
                 stdout=completed.stdout,
                 stderr=completed.stderr,
+                duration_seconds=completed.duration_seconds,
             )
         except subprocess.TimeoutExpired as error:
             result = VerificationResult(
@@ -337,6 +408,7 @@ def _run_verification(
                 return_code=124,
                 stdout=error.stdout or "",
                 stderr=f"Timed out after {config.limits.agent_timeout_seconds} seconds",
+                duration_seconds=float(config.limits.agent_timeout_seconds),
             )
         results.append(result)
         log_path = run_directory / f"verification-{round_number:02d}-{index:02d}.log"
@@ -345,7 +417,18 @@ def _run_verification(
             f"stdout:\n{result.stdout}\n\nstderr:\n{result.stderr}\n",
             encoding="utf-8",
         )
+        progress.finish(
+            f"{'Passed' if result.passed else 'Failed'} · "
+            f"{format_duration(result.duration_seconds)}"
+            + ("" if result.passed else f" · exit {result.return_code}"),
+            passed=result.passed,
+        )
     return results
+
+
+def _changed_file_count(project_root: Path) -> int:
+    status = _git(project_root, "status", "--short", "--untracked-files=all")
+    return len([line for line in status.splitlines() if line.strip()])
 
 
 def _require_clean_worktree(project_root: Path, task_path: Path) -> None:

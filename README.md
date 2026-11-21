@@ -172,6 +172,47 @@ dual-agent-task implement \
 Успішний результат має статус `ready_for_human_review`. Harness не створює
 commit: після перевірки ви робите його самостійно.
 
+### Прогрес у терміналі
+
+За замовчуванням `plan` та `implement` показують live-прогрес із timestamps:
+поточний агент і модель, читання та редагування файлів, verification-команди,
+heartbeat для довгих операцій, тривалість і фінальний verdict. Harness не
+вигадує відсоток завершення, оскільки agent CLI його не надають.
+
+```text
+16:42:03 [1/3] Codex implementing · gpt-5.6-sol/medium
+16:42:27       Editing Streamer/StreamSetup/Contest/Sport.swift
+16:43:08       Running xcodebuild test ...
+16:45:31       Still working… 03:28
+16:48:02 ✓     Codex finished · 05:59 · 15 files changed
+16:48:02 [1/3] Verification 1/2 · git diff --check
+16:48:03 ✓     Passed · 00:01
+16:50:17 [1/3] Claude reviewing · sonnet/high
+16:52:11 ✓     Review finished · approved · 01:54
+```
+
+Доступні режими:
+
+```bash
+# Стандартний компактний live-прогрес
+dual-agent-task implement --project /path/to/project tasks/my-feature.md
+
+# Текстовий формат для CI та лог-файлів
+dual-agent-task implement --progress plain \
+  --project /path/to/project tasks/my-feature.md
+
+# Повні JSONL-події агентів і весь stdout/stderr verification
+dual-agent-task implement --verbose \
+  --project /path/to/project tasks/my-feature.md
+
+# Лише фінальний результат або помилка
+dual-agent-task implement --quiet \
+  --project /path/to/project tasks/my-feature.md
+```
+
+Повний stdout/stderr verification і raw-відповіді агентів завжди зберігаються
+в `.dual-agent-task/runs/`, незалежно від обраного режиму термінала.
+
 Якщо реалізація вже є у working tree, але попередній запуск перервався на
 verification або review, продовжуйте без повторного першого запуску implementer-а:
 

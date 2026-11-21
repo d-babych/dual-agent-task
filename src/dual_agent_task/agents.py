@@ -5,9 +5,16 @@ import os
 from pathlib import Path
 import re
 import subprocess
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from dual_agent_task.errors import HarnessError
+from dual_agent_task.process_runner import run_streaming_process
+from dual_agent_task.progress import summarize_claude_event, summarize_codex_event
+
+
+ActivityHandler = Callable[[str], None]
+HeartbeatHandler = Callable[[float], None]
+RawHandler = Callable[[str, str], None]
 
 
 def run_claude_structured(
@@ -20,14 +27,20 @@ def run_claude_structured(
     model: Optional[str] = None,
     effort: Optional[str] = None,
     raw_output_path: Optional[Path] = None,
+    on_activity: Optional[ActivityHandler] = None,
+    on_heartbeat: Optional[HeartbeatHandler] = None,
+    on_raw: Optional[RawHandler] = None,
 ) -> dict[str, Any]:
     schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    captured_stdout: list[str] = []
     command = (
         "claude",
         "-p",
         *_claude_runtime_arguments(model=model, effort=effort),
         "--output-format",
-        "json",
+        "stream-json",
+        "--verbose",
+        "--include-hook-events",
         "--json-schema",
         json.dumps(schema, separators=(",", ":")),
         "--permission-mode",
@@ -36,7 +49,28 @@ def run_claude_structured(
         ",".join(tools),
         "--no-session-persistence",
     )
-    result = _run(command, prompt, project_root, timeout_seconds)
+
+    def handle_line(source: str, line: str) -> None:
+        if source == "stdout":
+            captured_stdout.append(line)
+        if on_raw is not None:
+            on_raw(source, line)
+        if source == "stdout" and on_activity is not None:
+            for activity in summarize_claude_event(line):
+                on_activity(activity)
+
+    try:
+        result = _run(
+            command,
+            prompt,
+            project_root,
+            timeout_seconds,
+            on_line=handle_line,
+            on_heartbeat=on_heartbeat,
+        )
+    except HarnessError:
+        _write_captured_output(raw_output_path, captured_stdout)
+        raise
     if raw_output_path is not None:
         raw_output_path.write_text(result.stdout, encoding="utf-8")
     required = tuple(str(key) for key in schema.get("required", []))
@@ -52,6 +86,10 @@ def run_codex_structured(
     timeout_seconds: int,
     model: Optional[str] = None,
     effort: Optional[str] = None,
+    on_activity: Optional[ActivityHandler] = None,
+    on_heartbeat: Optional[HeartbeatHandler] = None,
+    on_raw: Optional[RawHandler] = None,
+    raw_output_path: Optional[Path] = None,
 ) -> dict[str, Any]:
     return _run_codex_structured(
         prompt=prompt,
@@ -63,6 +101,10 @@ def run_codex_structured(
         approve_for_me=False,
         model=model,
         effort=effort,
+        on_activity=on_activity,
+        on_heartbeat=on_heartbeat,
+        on_raw=on_raw,
+        raw_output_path=raw_output_path,
     )
 
 
@@ -75,6 +117,10 @@ def run_codex_write_structured(
     timeout_seconds: int,
     model: Optional[str] = None,
     effort: Optional[str] = None,
+    on_activity: Optional[ActivityHandler] = None,
+    on_heartbeat: Optional[HeartbeatHandler] = None,
+    on_raw: Optional[RawHandler] = None,
+    raw_output_path: Optional[Path] = None,
 ) -> dict[str, Any]:
     return _run_codex_structured(
         prompt=prompt,
@@ -86,6 +132,10 @@ def run_codex_write_structured(
         approve_for_me=True,
         model=model,
         effort=effort,
+        on_activity=on_activity,
+        on_heartbeat=on_heartbeat,
+        on_raw=on_raw,
+        raw_output_path=raw_output_path,
     )
 
 
@@ -100,12 +150,17 @@ def _run_codex_structured(
     approve_for_me: bool,
     model: Optional[str],
     effort: Optional[str],
+    on_activity: Optional[ActivityHandler],
+    on_heartbeat: Optional[HeartbeatHandler],
+    on_raw: Optional[RawHandler],
+    raw_output_path: Optional[Path],
 ) -> dict[str, Any]:
     command = (
         "codex",
         "exec",
         *_codex_runtime_arguments(model=model, effort=effort),
         "--ephemeral",
+        "--json",
         *_codex_permission_arguments(
             sandbox=sandbox,
             approve_for_me=approve_for_me,
@@ -116,7 +171,32 @@ def _run_codex_structured(
         str(output_path),
         "-",
     )
-    _run(command, prompt, project_root, timeout_seconds)
+    captured_stdout: list[str] = []
+
+    def handle_line(source: str, line: str) -> None:
+        if source == "stdout":
+            captured_stdout.append(line)
+        if on_raw is not None:
+            on_raw(source, line)
+        if source == "stdout" and on_activity is not None:
+            activity = summarize_codex_event(line)
+            if activity is not None:
+                on_activity(activity)
+
+    try:
+        result = _run(
+            command,
+            prompt,
+            project_root,
+            timeout_seconds,
+            on_line=handle_line,
+            on_heartbeat=on_heartbeat,
+        )
+    except HarnessError:
+        _write_captured_output(raw_output_path, captured_stdout)
+        raise
+    if raw_output_path is not None:
+        raw_output_path.write_text(result.stdout, encoding="utf-8")
     if not output_path.is_file():
         raise HarnessError(f"Codex did not create structured output at {output_path}")
     try:
@@ -126,6 +206,11 @@ def _run_codex_structured(
     if not isinstance(value, dict):
         raise HarnessError("Codex structured output must be a JSON object")
     return value
+
+
+def _write_captured_output(path: Optional[Path], lines: list[str]) -> None:
+    if path is not None:
+        path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
 
 
 def _claude_runtime_arguments(
@@ -165,21 +250,22 @@ def _run(
     prompt: str,
     project_root: Path,
     timeout_seconds: int,
+    on_line: Optional[RawHandler] = None,
+    on_heartbeat: Optional[HeartbeatHandler] = None,
 ) -> subprocess.CompletedProcess[str]:
     environment = os.environ.copy()
     environment.pop("OPENAI_API_KEY", None)
     environment.pop("ANTHROPIC_API_KEY", None)
 
     try:
-        result = subprocess.run(
+        streamed = run_streaming_process(
             command,
             cwd=project_root,
-            input=prompt,
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
-            env=environment,
-            check=False,
+            input_text=prompt,
+            timeout_seconds=timeout_seconds,
+            environment=environment,
+            on_line=on_line,
+            on_heartbeat=on_heartbeat,
         )
     except FileNotFoundError as error:
         raise HarnessError(f"Agent CLI was not found: {command[0]}") from error
@@ -188,19 +274,23 @@ def _run(
             f"{command[0]} timed out after {timeout_seconds} seconds"
         ) from error
 
-    if result.returncode != 0:
-        detail = result.stderr.strip() or result.stdout.strip() or "no output"
-        raise HarnessError(f"{command[0]} failed with exit code {result.returncode}: {detail}")
-    return result
+    if streamed.return_code != 0:
+        detail = streamed.stderr.strip() or streamed.stdout.strip() or "no output"
+        raise HarnessError(
+            f"{command[0]} failed with exit code {streamed.return_code}: {detail}"
+        )
+    return subprocess.CompletedProcess(
+        command,
+        streamed.return_code,
+        stdout=streamed.stdout,
+        stderr=streamed.stderr,
+    )
 
 
 def _extract_claude_structured_output(
     stdout: str, *, required_keys: tuple[str, ...] = ()
 ) -> dict[str, Any]:
-    try:
-        envelope = json.loads(stdout)
-    except json.JSONDecodeError as error:
-        raise HarnessError(f"Claude returned invalid JSON: {error}") from error
+    envelope = _decode_claude_output(stdout)
 
     structured = _find_structured_object(envelope, required_keys=required_keys)
     if structured is not None:
@@ -217,6 +307,26 @@ def _extract_claude_structured_output(
         "Claude response did not contain the required structured object; "
         f"required={list(required_keys)}, envelope_keys={keys}"
     )
+
+
+def _decode_claude_output(stdout: str) -> Any:
+    try:
+        return json.loads(stdout)
+    except json.JSONDecodeError as single_error:
+        events: list[Any] = []
+        for line in stdout.splitlines():
+            if not line.strip():
+                continue
+            try:
+                events.append(json.loads(line))
+            except json.JSONDecodeError as error:
+                raise HarnessError(f"Claude returned invalid JSON stream: {error}") from error
+        if not events:
+            raise HarnessError(f"Claude returned invalid JSON: {single_error}") from single_error
+        for event in reversed(events):
+            if isinstance(event, dict) and event.get("type") == "result":
+                return event
+        return events[-1]
 
 
 def _find_structured_object(

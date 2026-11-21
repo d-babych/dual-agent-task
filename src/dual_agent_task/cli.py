@@ -12,6 +12,7 @@ from dual_agent_task.implementation_workflow import (
     run_implementation_workflow,
 )
 from dual_agent_task.project import initialize_project, run_doctor, upgrade_project
+from dual_agent_task.progress import ConsoleProgress
 from dual_agent_task.spec_workflow import run_spec_workflow
 from dual_agent_task.task_file import adopt_approved_task, approve_task, read_status
 
@@ -60,6 +61,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Keep current changes and resume from verification/review",
     )
+    _add_progress_arguments(implement_parser)
     implement_parser.set_defaults(handler=_handle_implement)
 
     recover_parser = subparsers.add_parser(
@@ -142,6 +144,31 @@ def _handle_upgrade(arguments: argparse.Namespace) -> int:
 def _add_plan_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--project", default=".")
     parser.add_argument("--input", type=Path)
+    _add_progress_arguments(parser)
+
+
+def _add_progress_arguments(parser: argparse.ArgumentParser) -> None:
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--progress",
+        choices=("live", "plain", "quiet", "verbose"),
+        default="live",
+        help="Terminal progress style (default: live)",
+    )
+    group.add_argument(
+        "--quiet",
+        dest="progress",
+        action="store_const",
+        const="quiet",
+        help="Hide intermediate progress",
+    )
+    group.add_argument(
+        "--verbose",
+        dest="progress",
+        action="store_const",
+        const="verbose",
+        help="Show raw agent and verification output",
+    )
 
 
 def _handle_plan(arguments: argparse.Namespace) -> int:
@@ -156,6 +183,7 @@ def _handle_plan(arguments: argparse.Namespace) -> int:
     task_path = run_spec_workflow(
         config=config,
         feature_description=description,
+        progress=ConsoleProgress(arguments.progress),
     )
     status = read_status(task_path)
     print(f"Task created: {task_path}")
@@ -171,8 +199,9 @@ def _handle_implement(arguments: argparse.Namespace) -> int:
         config=config,
         task_path=arguments.task,
         resume_review=arguments.resume_review,
+        progress=ConsoleProgress(arguments.progress),
     )
-    print(f"Implementation status: {outcome.status}")
+    print(f"Result: {outcome.status}")
     print(f"Rounds: {outcome.rounds}")
     print(f"Run artifacts: {outcome.run_directory}")
     if outcome.status == "ready_for_human_review":

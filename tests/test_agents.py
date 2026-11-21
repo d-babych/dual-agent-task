@@ -97,6 +97,50 @@ class ClaudeOutputTests(unittest.TestCase):
         self.assertEqual(value["findings"], [])
         self.assertIn("Build passed", value["summary"])
 
+    def test_extracts_structured_output_from_claude_jsonl_stream(self) -> None:
+        stdout = "\n".join(
+            (
+                json.dumps({"type": "system", "subtype": "init"}),
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "message": {
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "name": "Read",
+                                    "input": {"file_path": "Sport.swift"},
+                                }
+                            ]
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "result",
+                        "structured_output": {
+                            "verdict": "approved",
+                            "summary": "Ready.",
+                            "findings": [],
+                            "verification_assessment": "Passed.",
+                        },
+                    }
+                ),
+            )
+        )
+
+        value = _extract_claude_structured_output(
+            stdout,
+            required_keys=(
+                "verdict",
+                "summary",
+                "findings",
+                "verification_assessment",
+            ),
+        )
+
+        self.assertEqual(value["verdict"], "approved")
+
     def test_builds_claude_model_and_effort_arguments(self) -> None:
         self.assertEqual(
             _claude_runtime_arguments(model="sonnet", effort="high"),

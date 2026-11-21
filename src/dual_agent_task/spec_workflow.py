@@ -4,11 +4,13 @@ from datetime import datetime, timezone
 import json
 from pathlib import Path
 import re
+import time
 from typing import Any, Callable
 
 from dual_agent_task.agents import run_claude_structured, run_codex_structured
 from dual_agent_task.config import HarnessConfig
 from dual_agent_task.errors import HarnessError
+from dual_agent_task.progress import CallbackProgress, ProgressReporter, format_duration
 from dual_agent_task.task_file import render_task
 
 
@@ -20,7 +22,9 @@ def run_spec_workflow(
     config: HarnessConfig,
     feature_description: str,
     report: Reporter = print,
+    progress: ProgressReporter | None = None,
 ) -> Path:
+    output = progress or CallbackProgress(report)
     description = feature_description.strip()
     if not description:
         raise HarnessError("Feature description cannot be empty")
@@ -48,10 +52,11 @@ def run_spec_workflow(
     final_status = "review_incomplete"
 
     for round_number in range(1, config.limits.max_spec_rounds + 1):
-        report(
-            f"[{round_number}/{config.limits.max_spec_rounds}] Claude is drafting "
-            f"the task ({_runtime_label(config.models.spec_author, config.effort.spec_author)})..."
+        output.start(
+            f"[{round_number}/{config.limits.max_spec_rounds}] Claude drafting task · "
+            f"{_runtime_label(config.models.spec_author, config.effort.spec_author)}"
         )
+        author_started = time.monotonic()
         author_prompt = _render_prompt(
             author_template,
             PROJECT_RULES=rules,
@@ -59,16 +64,33 @@ def run_spec_workflow(
             CURRENT_TASK=current_task,
             LATEST_REVIEW=latest_review,
         )
-        author_result = run_claude_structured(
-            prompt=author_prompt,
-            schema_path=task_schema,
-            project_root=config.project_root,
-            timeout_seconds=config.limits.agent_timeout_seconds,
-            model=config.models.spec_author,
-            effort=config.effort.spec_author,
-            raw_output_path=run_directory / f"claude-author-{round_number:02d}.raw.json",
-        )
+        try:
+            author_result = run_claude_structured(
+                prompt=author_prompt,
+                schema_path=task_schema,
+                project_root=config.project_root,
+                timeout_seconds=config.limits.agent_timeout_seconds,
+                model=config.models.spec_author,
+                effort=config.effort.spec_author,
+                raw_output_path=run_directory
+                / f"claude-author-{round_number:02d}.raw.json",
+                on_activity=output.activity,
+                on_heartbeat=output.heartbeat,
+                on_raw=output.raw,
+            )
+        except HarnessError as error:
+            output.finish(
+                f"Claude drafting failed · "
+                f"{format_duration(time.monotonic() - author_started)}",
+                passed=False,
+            )
+            raise HarnessError(
+                f"{error}\nRun artifacts: {run_directory}"
+            ) from error
         _validate_author_result(author_result)
+        output.finish(
+            f"Draft finished · {format_duration(time.monotonic() - author_started)}"
+        )
         if stable_slug is None:
             stable_slug = _safe_slug(str(author_result["slug"]))
             existing_task = config.project_root / "tasks" / f"{stable_slug}.md"
@@ -83,10 +105,11 @@ def run_spec_workflow(
             f"{current_task}\n", encoding="utf-8"
         )
 
-        report(
-            f"[{round_number}/{config.limits.max_spec_rounds}] Codex is reviewing "
-            f"the task ({_runtime_label(config.models.spec_reviewer, config.effort.spec_reviewer)})..."
+        output.start(
+            f"[{round_number}/{config.limits.max_spec_rounds}] Codex reviewing task · "
+            f"{_runtime_label(config.models.spec_reviewer, config.effort.spec_reviewer)}"
         )
+        review_started = time.monotonic()
         reviewer_prompt = _render_prompt(
             reviewer_template,
             PROJECT_RULES=rules,
@@ -94,24 +117,43 @@ def run_spec_workflow(
             CURRENT_TASK=current_task,
         )
         reviewer_output = run_directory / f"codex-review-{round_number:02d}.json"
-        review = run_codex_structured(
-            prompt=reviewer_prompt,
-            schema_path=review_schema,
-            output_path=reviewer_output,
-            project_root=config.project_root,
-            timeout_seconds=config.limits.agent_timeout_seconds,
-            model=config.models.spec_reviewer,
-            effort=config.effort.spec_reviewer,
-        )
+        try:
+            review = run_codex_structured(
+                prompt=reviewer_prompt,
+                schema_path=review_schema,
+                output_path=reviewer_output,
+                project_root=config.project_root,
+                timeout_seconds=config.limits.agent_timeout_seconds,
+                model=config.models.spec_reviewer,
+                effort=config.effort.spec_reviewer,
+                on_activity=output.activity,
+                on_heartbeat=output.heartbeat,
+                on_raw=output.raw,
+                raw_output_path=run_directory
+                / f"codex-review-{round_number:02d}.raw.jsonl",
+            )
+        except HarnessError as error:
+            output.finish(
+                f"Codex review failed · "
+                f"{format_duration(time.monotonic() - review_started)}",
+                passed=False,
+            )
+            raise HarnessError(
+                f"{error}\nRun artifacts: {run_directory}"
+            ) from error
         _validate_review(review)
         _write_json(run_directory / f"review-{round_number:02d}.json", review)
         latest_review = json.dumps(review, ensure_ascii=False, indent=2)
 
         verdict = review["verdict"]
-        report(f"Codex verdict: {verdict}")
+        output.finish(
+            f"Review finished · {verdict} · "
+            f"{format_duration(time.monotonic() - review_started)}",
+            passed=verdict == "approved",
+        )
         if verdict == "approved":
             if author_result["open_questions"]:
-                report("The draft still has open questions; human input is required.")
+                output.info("The draft still has open questions; human input is required.")
                 final_status = "needs_user_input"
             else:
                 final_status = "ready_for_human"
@@ -162,7 +204,7 @@ def run_spec_workflow(
 
 
 def _runtime_label(model: object, effort: object) -> str:
-    return f"model={model or 'CLI default'}, effort={effort or 'CLI default'}"
+    return f"{model or 'CLI default'}/{effort or 'CLI default'}"
 
 
 def _render_prompt(template: str, **values: str) -> str:
