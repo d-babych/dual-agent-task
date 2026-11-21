@@ -1,10 +1,12 @@
 from pathlib import Path
+import json
 import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
 
 from dual_agent_task.config import HarnessConfig
+from dual_agent_task.errors import HarnessError
 from dual_agent_task.implementation_workflow import (
     recover_implementation_review,
     run_implementation_workflow,
@@ -14,6 +16,77 @@ from dual_agent_task.task_file import render_task
 
 
 class ImplementationWorkflowTests(unittest.TestCase):
+    def test_staged_task_runs_only_selected_stage_and_records_outcome(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            _initialize_git_repository(root)
+            initialize_project(root)
+            task_path = root / "tasks" / "staged-feature.md"
+            task_path.write_text(
+                render_task(
+                    slug="staged-feature",
+                    status="approved",
+                    title="Staged feature",
+                    markdown=_staged_markdown(),
+                ),
+                encoding="utf-8",
+            )
+            _git(root, "add", ".")
+            _git(root, "commit", "-m", "Add staged task")
+            config = HarnessConfig.load(root)
+            prompts = []
+
+            def implement(**arguments: object) -> dict[str, object]:
+                prompts.append(str(arguments["prompt"]))
+                (root / "domain.txt").write_text("implemented\n", encoding="utf-8")
+                return {"summary": "Done.", "tests_run": [], "remaining_risks": []}
+
+            def review(**arguments: object) -> dict[str, object]:
+                prompts.append(str(arguments["prompt"]))
+                return {
+                    "verdict": "approved",
+                    "summary": "Stage is ready.",
+                    "findings": [],
+                    "verification_assessment": "Passed.",
+                }
+
+            with patch(
+                "dual_agent_task.implementation_workflow.run_codex_write_structured",
+                side_effect=implement,
+            ), patch(
+                "dual_agent_task.implementation_workflow.run_claude_structured",
+                side_effect=review,
+            ):
+                outcome = run_implementation_workflow(
+                    config=config,
+                    task_path=task_path,
+                    stage_selector="domain-model",
+                    report=lambda _: None,
+                )
+
+            self.assertEqual(outcome.status, "ready_for_human_review")
+            self.assertEqual(outcome.stage_id, "domain-model")
+            self.assertTrue(all("exactly one stage: `domain-model`" in prompt for prompt in prompts))
+            result = json.loads(
+                (outcome.run_directory / "result.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(result["stage_id"], "domain-model")
+            state = json.loads(
+                (config.state_directory / "staged-feature.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                state["stages"]["domain-model"]["status"],
+                "ready_for_human_review",
+            )
+
+            with self.assertRaisesRegex(HarnessError, "blocked by"):
+                run_implementation_workflow(
+                    config=config,
+                    task_path=task_path,
+                    stage_selector="user-interface",
+                    report=lambda _: None,
+                )
+
     def test_approved_task_runs_implementation_and_review_separately(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -167,6 +240,57 @@ def _git(root: Path, *arguments: str) -> str:
         check=True,
     )
     return result.stdout.strip()
+
+
+def _staged_markdown() -> str:
+    return """## Goal
+
+Deliver a staged feature.
+
+## Implementation stages
+
+### Stage 1: Domain model
+
+stage_id: domain-model
+depends_on: []
+
+#### Goal
+
+Add domain behavior.
+
+#### Scope
+
+- Domain files.
+
+#### Acceptance criteria
+
+- Domain behavior works.
+
+#### Test plan
+
+- Run domain tests.
+
+### Stage 2: User interface
+
+stage_id: user-interface
+depends_on: [domain-model]
+
+#### Goal
+
+Add UI behavior.
+
+#### Scope
+
+- UI files.
+
+#### Acceptance criteria
+
+- UI behavior works.
+
+#### Test plan
+
+- Run UI tests.
+"""
 
 
 if __name__ == "__main__":

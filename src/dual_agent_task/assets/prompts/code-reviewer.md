@@ -5,6 +5,10 @@ verification results. Report only actionable findings with evidence. Do not edit
 files, run shell commands, create commits, or push. You may use Read, Glob, and
 Grep to inspect relevant files, including untracked files listed by git status.
 
+The harness may append a stage execution scope. If present, review only that
+stage, reject work belonging exclusively to later stages, and check completed
+stages for regressions.
+
 Use `approved` only when the implementation satisfies the task and there are no
 blocking findings. Use `needs_user_input` only for a decision that cannot safely
 be made from the approved task. Otherwise use `changes_requested`.

@@ -11,6 +11,11 @@ from dual_agent_task.agents import run_claude_structured, run_codex_structured
 from dual_agent_task.config import HarnessConfig
 from dual_agent_task.errors import HarnessError
 from dual_agent_task.progress import CallbackProgress, ProgressReporter, format_duration
+from dual_agent_task.stages import (
+    STAGE_MODES,
+    stage_planning_instructions,
+    validate_stage_mode,
+)
 from dual_agent_task.task_file import render_task
 
 
@@ -23,11 +28,14 @@ def run_spec_workflow(
     feature_description: str,
     report: Reporter = print,
     progress: ProgressReporter | None = None,
+    stage_mode: str = "auto",
 ) -> Path:
     output = progress or CallbackProgress(report)
     description = feature_description.strip()
     if not description:
         raise HarnessError("Feature description cannot be empty")
+    if stage_mode not in STAGE_MODES:
+        raise HarnessError(f"Unsupported stage mode: {stage_mode}")
     if config.agents.spec_author != "claude" or config.agents.spec_reviewer != "codex":
         raise HarnessError(
             "The MVP currently supports `claude` as spec_author and `codex` "
@@ -38,6 +46,9 @@ def run_spec_workflow(
     run_directory = config.runs_directory / run_id
     run_directory.mkdir(parents=True, exist_ok=False)
     (run_directory / "input.md").write_text(f"{description}\n", encoding="utf-8")
+    (run_directory / "stage-mode.txt").write_text(
+        f"{stage_mode}\n", encoding="utf-8"
+    )
 
     rules = _read(config.project_root / "PROJECT_RULES.md")
     author_template = _read(config.prompts_directory / "spec-author.md")
@@ -50,6 +61,8 @@ def run_spec_workflow(
     stable_slug: str | None = None
     final_author: dict[str, Any] | None = None
     final_status = "review_incomplete"
+    stage_policy = stage_planning_instructions(stage_mode)
+    final_stages = ()
 
     for round_number in range(1, config.limits.max_spec_rounds + 1):
         output.start(
@@ -64,6 +77,7 @@ def run_spec_workflow(
             CURRENT_TASK=current_task,
             LATEST_REVIEW=latest_review,
         )
+        author_prompt = f"{author_prompt.rstrip()}\n\n{stage_policy}\n"
         try:
             author_result = run_claude_structured(
                 prompt=author_prompt,
@@ -100,6 +114,12 @@ def run_spec_workflow(
                 )
         final_author = author_result
         current_task = str(author_result["task_markdown"]).strip()
+        final_stages = ()
+        stage_validation_error: HarnessError | None = None
+        try:
+            final_stages = validate_stage_mode(current_task, stage_mode)
+        except HarnessError as error:
+            stage_validation_error = error
         _write_json(run_directory / f"spec-round-{round_number:02d}.json", author_result)
         (run_directory / f"task-draft-{round_number:02d}.md").write_text(
             f"{current_task}\n", encoding="utf-8"
@@ -115,6 +135,12 @@ def run_spec_workflow(
             PROJECT_RULES=rules,
             FEATURE_DESCRIPTION=description,
             CURRENT_TASK=current_task,
+        )
+        reviewer_prompt = (
+            f"{reviewer_prompt.rstrip()}\n\n{stage_policy}\n\n"
+            "Treat violations of the harness stage policy or malformed stage metadata "
+            "as blocking findings. In auto mode, also review whether the author's choice "
+            "to use or omit stages is reasonable for the requested work.\n"
         )
         reviewer_output = run_directory / f"codex-review-{round_number:02d}.json"
         try:
@@ -142,6 +168,8 @@ def run_spec_workflow(
                 f"{error}\nRun artifacts: {run_directory}"
             ) from error
         _validate_review(review)
+        if stage_validation_error is not None:
+            review = _with_stage_validation_error(review, stage_validation_error)
         _write_json(run_directory / f"review-{round_number:02d}.json", review)
         latest_review = json.dumps(review, ensure_ascii=False, indent=2)
 
@@ -181,6 +209,8 @@ def run_spec_workflow(
             {
                 "status": final_status,
                 "task_path": str(task_path),
+                "stage_mode": stage_mode,
+                "stages": [stage.stage_id for stage in final_stages],
                 "runtimes": {
                     "spec_author": {
                         "agent": config.agents.spec_author,
@@ -243,6 +273,26 @@ def _validate_review(value: dict[str, Any]) -> None:
     for key in ("summary", "blocking", "suggestions"):
         if key not in value:
             raise HarnessError(f"Review result is missing `{key}`")
+
+
+def _with_stage_validation_error(
+    review: dict[str, Any], error: HarnessError
+) -> dict[str, Any]:
+    blocking = list(review.get("blocking", []))
+    blocking.append(
+        {
+            "id": "STAGE-FORMAT",
+            "section": "Implementation stages",
+            "issue": str(error),
+            "expected_fix": "Follow the appended harness stage policy exactly.",
+        }
+    )
+    return {
+        **review,
+        "verdict": "changes_requested",
+        "summary": "The task stage structure must be corrected.",
+        "blocking": blocking,
+    }
 
 
 def _write_json(path: Path, value: dict[str, Any]) -> None:

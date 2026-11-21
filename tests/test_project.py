@@ -43,6 +43,11 @@ class InitializeProjectTests(unittest.TestCase):
                 ".dual-agent-task/runs/",
                 (root / ".gitignore").read_text(encoding="utf-8").splitlines(),
             )
+            self.assertIn(
+                ".dual-agent-task/state/",
+                (root / ".gitignore").read_text(encoding="utf-8").splitlines(),
+            )
+            self.assertTrue((root / ".dual-agent-task" / "state").is_dir())
 
             config = HarnessConfig.load(root)
             self.assertEqual(config.agents.spec_author, "claude")

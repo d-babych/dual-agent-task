@@ -22,6 +22,9 @@ decisions. If a required decision cannot be inferred, add it to open_questions.
 Apply all valid reviewer feedback. Ignore suggestions that contradict the
 feature request or project rules.
 
+The harness may append a stage policy. Follow it exactly. When stages are used,
+keep each stage independently implementable and reviewable.
+
 ## Project rules
 
 {{PROJECT_RULES}}

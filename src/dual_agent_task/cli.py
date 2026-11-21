@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 import sys
 
@@ -14,6 +15,12 @@ from dual_agent_task.implementation_workflow import (
 from dual_agent_task.project import initialize_project, run_doctor, upgrade_project
 from dual_agent_task.progress import ConsoleProgress
 from dual_agent_task.spec_workflow import run_spec_workflow
+from dual_agent_task.stages import (
+    complete_stage,
+    parse_task_stages,
+    stage_status_payload,
+    stage_statuses,
+)
 from dual_agent_task.task_file import adopt_approved_task, approve_task, read_status
 
 
@@ -57,6 +64,10 @@ def build_parser() -> argparse.ArgumentParser:
     implement_parser.add_argument("task", type=Path)
     implement_parser.add_argument("--project", default=".")
     implement_parser.add_argument(
+        "--stage",
+        help="Implementation stage id, number, or `next`",
+    )
+    implement_parser.add_argument(
         "--resume-review",
         action="store_true",
         help="Keep current changes and resume from verification/review",
@@ -90,6 +101,23 @@ def build_parser() -> argparse.ArgumentParser:
     adopt_parser.add_argument("--project", default=".")
     adopt_parser.add_argument("--slug")
     adopt_parser.set_defaults(handler=_handle_task_adopt)
+
+    stages_parser = task_subparsers.add_parser(
+        "stages", help="List implementation stages and their local status"
+    )
+    stages_parser.add_argument("path", type=Path)
+    stages_parser.add_argument("--project", default=".")
+    stages_parser.add_argument("--json", action="store_true", dest="json_output")
+    stages_parser.set_defaults(handler=_handle_task_stages)
+
+    complete_stage_parser = task_subparsers.add_parser(
+        "complete-stage",
+        help="Mark an approved and manually committed stage as completed",
+    )
+    complete_stage_parser.add_argument("path", type=Path)
+    complete_stage_parser.add_argument("stage")
+    complete_stage_parser.add_argument("--project", default=".")
+    complete_stage_parser.set_defaults(handler=_handle_task_complete_stage)
 
     return parser
 
@@ -144,6 +172,27 @@ def _handle_upgrade(arguments: argparse.Namespace) -> int:
 def _add_plan_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--project", default=".")
     parser.add_argument("--input", type=Path)
+    stage_group = parser.add_mutually_exclusive_group()
+    stage_group.add_argument(
+        "--stages",
+        choices=("auto", "required", "disabled"),
+        default="auto",
+        help="Stage planning policy (default: auto)",
+    )
+    stage_group.add_argument(
+        "--staged",
+        dest="stages",
+        action="store_const",
+        const="required",
+        help="Alias for `--stages required`",
+    )
+    stage_group.add_argument(
+        "--no-stages",
+        dest="stages",
+        action="store_const",
+        const="disabled",
+        help="Alias for `--stages disabled`",
+    )
     _add_progress_arguments(parser)
 
 
@@ -184,10 +233,18 @@ def _handle_plan(arguments: argparse.Namespace) -> int:
         config=config,
         feature_description=description,
         progress=ConsoleProgress(arguments.progress),
+        stage_mode=arguments.stages,
     )
     status = read_status(task_path)
     print(f"Task created: {task_path}")
     print(f"Status: {status}")
+    stages = parse_task_stages(task_path.read_text(encoding="utf-8"))
+    if stages:
+        print(f"Stages: {len(stages)}")
+        print(
+            "List with: dual-agent-task task stages "
+            f"--project {config.project_root} {task_path}"
+        )
     if status == "ready_for_human":
         print(f"Approve with: dual-agent-task task approve {task_path}")
     return 0
@@ -200,12 +257,23 @@ def _handle_implement(arguments: argparse.Namespace) -> int:
         task_path=arguments.task,
         resume_review=arguments.resume_review,
         progress=ConsoleProgress(arguments.progress),
+        stage_selector=arguments.stage,
     )
     print(f"Result: {outcome.status}")
     print(f"Rounds: {outcome.rounds}")
     print(f"Run artifacts: {outcome.run_directory}")
+    if outcome.stage_id is not None:
+        print(f"Stage: {outcome.stage_id}")
     if outcome.status == "ready_for_human_review":
         print("Review the working tree with `git status` and `git diff`, then commit manually.")
+        if outcome.stage_id is not None:
+            task_path = arguments.task.expanduser()
+            if not task_path.is_absolute():
+                task_path = (config.project_root / task_path).resolve()
+            print(
+                "After the commit: dual-agent-task task complete-stage "
+                f"--project {config.project_root} {task_path} {outcome.stage_id}"
+            )
         return 0
     return 2
 
@@ -252,6 +320,55 @@ def _handle_task_adopt(arguments: argparse.Namespace) -> int:
         "Implement with: dual-agent-task implement "
         f"--project {Path(arguments.project).expanduser().resolve()} {path}"
     )
+    return 0
+
+
+def _handle_task_stages(arguments: argparse.Namespace) -> int:
+    path = arguments.path.expanduser().resolve()
+    if not path.is_file():
+        raise HarnessError(f"Task file does not exist: {path}")
+    project_root = Path(arguments.project).expanduser().resolve()
+    stages = parse_task_stages(path.read_text(encoding="utf-8"))
+    statuses = stage_statuses(
+        state_directory=project_root / ".dual-agent-task" / "state",
+        task_path=path,
+        stages=stages,
+    )
+    payload = stage_status_payload(statuses)
+    if arguments.json_output:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+    if not payload:
+        print("Task has no implementation stages.")
+        return 0
+    for item in payload:
+        suffix = ""
+        if item.get("blocked_by"):
+            suffix = f" · blocked by: {', '.join(item['blocked_by'])}"
+        print(
+            f"{item['number']}. {item['id']} · {item['status']}{suffix} · "
+            f"{item['title']}"
+        )
+    return 0
+
+
+def _handle_task_complete_stage(arguments: argparse.Namespace) -> int:
+    path = arguments.path.expanduser().resolve()
+    if not path.is_file():
+        raise HarnessError(f"Task file does not exist: {path}")
+    if read_status(path) != "approved":
+        raise HarnessError("Only an approved task can complete implementation stages")
+    project_root = Path(arguments.project).expanduser().resolve()
+    stages = parse_task_stages(path.read_text(encoding="utf-8"))
+    completed = complete_stage(
+        project_root=project_root,
+        state_directory=project_root / ".dual-agent-task" / "state",
+        task_path=path,
+        stages=stages,
+        selector=arguments.stage,
+    )
+    print(f"Completed stage: {completed.stage_id}")
+    print(f"Next: dual-agent-task implement --stage next --project {project_root} {path}")
     return 0
 
 

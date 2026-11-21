@@ -10,7 +10,7 @@ ROOT = Path(__file__).parent
 
 setup(
     name="dual-agent-task",
-    version="0.3.0",
+    version="0.4.0",
     description=(
         "A small local orchestrator for collaborative Codex and Claude Code workflows."
     ),

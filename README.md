@@ -74,12 +74,14 @@ verification-команди. Він лише додає відсутні фай�
   prompts/
   schemas/
   runs/              # ігнорується Git
+  state/             # локальний стан етапів, ігнорується Git
 tasks/
 PROJECT_RULES.md
 ```
 
 Існуючі файли не перезаписуються. Промпти, схеми й конфігурацію варто комітити;
-`.dual-agent-task/runs/` містить локальні журнали запусків.
+`.dual-agent-task/runs/` містить локальні журнали запусків, а
+`.dual-agent-task/state/` — локальний стан implementation stages.
 
 ## Моделі та effort
 
@@ -122,6 +124,57 @@ dual-agent-task plan --project /path/to/project
 dual-agent-task plan \
   --project /path/to/project \
   --input feature-description.md
+```
+
+Режим розбиття на implementation stages задається під час формулювання task:
+
+```bash
+# Claude сам вирішує, чи потрібні етапи; Codex перевіряє це рішення (default)
+dual-agent-task plan --stages auto --project /path/to/project
+
+# Task обов'язково повинен містити щонайменше два етапи
+dual-agent-task plan --stages required --project /path/to/project
+
+# Task має залишитися атомарним
+dual-agent-task plan --stages disabled --project /path/to/project
+```
+
+`--staged` є коротким alias для `--stages required`, а `--no-stages` — для
+`--stages disabled`. Кожен створений етап має стабільний `stage_id`, залежності,
+власні scope, acceptance criteria та test plan.
+
+Для task, написаних вручну, використовується такий формат:
+
+```markdown
+## Implementation stages
+
+### Stage 1: Domain model
+
+stage_id: domain-model
+depends_on: []
+
+#### Goal
+...
+#### Scope
+...
+#### Acceptance criteria
+...
+#### Test plan
+...
+
+### Stage 2: User interface
+
+stage_id: user-interface
+depends_on: [domain-model]
+
+#### Goal
+...
+#### Scope
+...
+#### Acceptance criteria
+...
+#### Test plan
+...
 ```
 
 Після agent review task матиме один зі статусів:
@@ -171,6 +224,50 @@ dual-agent-task implement \
 
 Успішний результат має статус `ready_for_human_review`. Harness не створює
 commit: після перевірки ви робите його самостійно.
+
+### Поетапне виконання
+
+Переглянути етапи та локальний стан:
+
+```bash
+dual-agent-task task stages \
+  --project /path/to/project \
+  tasks/my-feature.md
+
+dual-agent-task task stages --json \
+  --project /path/to/project \
+  tasks/my-feature.md
+```
+
+Запустити конкретний етап за ID, номером або вибрати наступний доступний:
+
+```bash
+dual-agent-task implement --stage domain-model \
+  --project /path/to/project tasks/my-feature.md
+
+dual-agent-task implement --stage 2 \
+  --project /path/to/project tasks/my-feature.md
+
+dual-agent-task implement --stage next \
+  --project /path/to/project tasks/my-feature.md
+```
+
+Task із кількома етапами не запускається без `--stage`. Codex отримує повний
+task як контекст, але реалізує лише поточний етап; Claude перевіряє scope етапу,
+регресії завершених етапів і відсутність передчасної реалізації наступних.
+
+Після статусу `ready_for_human_review` перегляньте зміни та створіть commit
+самостійно. Потім позначте етап завершеним:
+
+```bash
+dual-agent-task task complete-stage \
+  --project /path/to/project \
+  tasks/my-feature.md domain-model
+```
+
+`complete-stage` вимагає approved review, чистий working tree і новий commit.
+Залежні етапи розблоковуються лише після цього checkpoint. Локальний стан
+зберігається в `.dual-agent-task/state/` та ігнорується Git.
 
 ### Прогрес у терміналі
 

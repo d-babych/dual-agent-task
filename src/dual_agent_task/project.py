@@ -54,12 +54,14 @@ def initialize_project(project_root: Path) -> list[Path]:
     prompts_directory = harness_directory / "prompts"
     schemas_directory = harness_directory / "schemas"
     runs_directory = harness_directory / "runs"
+    state_directory = harness_directory / "state"
     tasks_directory = root / "tasks"
 
     for directory in (
         prompts_directory,
         schemas_directory,
         runs_directory,
+        state_directory,
         tasks_directory,
     ):
         directory.mkdir(parents=True, exist_ok=True)
@@ -95,6 +97,7 @@ def initialize_project(project_root: Path) -> list[Path]:
         )
 
     written.extend(_ensure_gitignore_entry(root, f"{CONFIG_DIRECTORY}/runs/"))
+    written.extend(_ensure_gitignore_entry(root, f"{CONFIG_DIRECTORY}/state/"))
     return written
 
 

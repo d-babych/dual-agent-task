@@ -8,7 +8,7 @@ from pathlib import Path
 import re
 import subprocess
 import time
-from typing import Callable
+from typing import Callable, Optional
 
 from dual_agent_task.agents import (
     _extract_claude_structured_output,
@@ -26,6 +26,13 @@ from dual_agent_task.progress import (
     summarize_verification_line,
 )
 from dual_agent_task.task_file import read_status
+from dual_agent_task.stages import (
+    TaskStage,
+    completed_stage_summary,
+    parse_task_stages,
+    record_stage_outcome,
+    select_stage,
+)
 
 
 Reporter = Callable[[str], None]
@@ -49,6 +56,7 @@ class ImplementationOutcome:
     status: str
     rounds: int
     run_directory: Path
+    stage_id: Optional[str] = None
 
 
 def recover_implementation_review(
@@ -114,26 +122,49 @@ def recover_implementation_review(
         status = "review_incomplete"
 
     _write_json(run_path / f"code-review-{round_number:02d}.json", review)
+    stage_metadata = _read_optional_json(run_path / "stage.json")
+    stage_id = (
+        str(stage_metadata["stage_id"])
+        if stage_metadata is not None and stage_metadata.get("stage_id")
+        else None
+    )
+    result_payload: dict[str, object] = {
+        "status": status,
+        "rounds": round_number,
+        "recovered_from_raw_review": True,
+        "verification_exit_codes": exit_codes,
+        "runtimes": {
+            "code_reviewer": {
+                "agent": config.agents.code_reviewer,
+                "model": config.models.code_reviewer,
+                "effort": config.effort.code_reviewer,
+            }
+        },
+    }
+    if stage_id is not None:
+        result_payload["stage_id"] = stage_id
     _write_json(
         run_path / "result.json",
-        {
-            "status": status,
-            "rounds": round_number,
-            "recovered_from_raw_review": True,
-            "verification_exit_codes": exit_codes,
-            "runtimes": {
-                "code_reviewer": {
-                    "agent": config.agents.code_reviewer,
-                    "model": config.models.code_reviewer,
-                    "effort": config.effort.code_reviewer,
-                }
-            },
-        },
+        result_payload,
     )
+    if stage_id is not None and stage_metadata is not None:
+        task_path = Path(str(stage_metadata["task_path"]))
+        stages = parse_task_stages(task_path.read_text(encoding="utf-8"))
+        selected = next(stage for stage in stages if stage.stage_id == stage_id)
+        record_stage_outcome(
+            state_directory=config.state_directory,
+            task_path=task_path,
+            stages=stages,
+            stage=selected,
+            outcome_status=status,
+            run_directory=run_path,
+            base_head=str(stage_metadata["base_head"]),
+        )
     return ImplementationOutcome(
         status=status,
         rounds=round_number,
         run_directory=run_path,
+        stage_id=stage_id,
     )
 
 
@@ -151,6 +182,7 @@ def run_implementation_workflow(
     report: Reporter = print,
     resume_review: bool = False,
     progress: ProgressReporter | None = None,
+    stage_selector: Optional[str] = None,
 ) -> ImplementationOutcome:
     output = progress or CallbackProgress(report)
     if config.agents.implementer != "codex" or config.agents.code_reviewer != "claude":
@@ -170,6 +202,20 @@ def run_implementation_workflow(
     if read_status(resolved_task) != "approved":
         raise HarnessError("Implementation requires a task with status `approved`")
 
+    approved_task = resolved_task.read_text(encoding="utf-8")
+    stages = parse_task_stages(approved_task)
+    selected_stage = select_stage(
+        state_directory=config.state_directory,
+        task_path=resolved_task,
+        stages=stages,
+        selector=stage_selector,
+    )
+    completed_stages = completed_stage_summary(
+        state_directory=config.state_directory,
+        task_path=resolved_task,
+        stages=stages,
+    )
+
     base_head = _git(config.project_root, "rev-parse", "HEAD").strip()
     if config.git.require_clean_worktree and not resume_review:
         _require_clean_worktree(config.project_root, resolved_task)
@@ -177,8 +223,30 @@ def run_implementation_workflow(
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ-implement")
     run_directory = config.runs_directory / run_id
     run_directory.mkdir(parents=True, exist_ok=False)
-    approved_task = resolved_task.read_text(encoding="utf-8")
     (run_directory / "approved-task.md").write_text(approved_task, encoding="utf-8")
+    stage_context = _stage_execution_context(
+        selected_stage=selected_stage,
+        stages=stages,
+        completed_stages=completed_stages,
+    )
+    if selected_stage is not None:
+        (run_directory / "current-stage.md").write_text(
+            f"{selected_stage.markdown}\n", encoding="utf-8"
+        )
+        _write_json(
+            run_directory / "stage.json",
+            {
+                "stage_id": selected_stage.stage_id,
+                "stage_number": selected_stage.index,
+                "stage_total": len(stages),
+                "task_path": str(resolved_task),
+                "base_head": base_head,
+            },
+        )
+        output.info(
+            f"Stage {selected_stage.index}/{len(stages)} · "
+            f"{selected_stage.stage_id} · {selected_stage.title}"
+        )
 
     rules = _read(config.project_root / "PROJECT_RULES.md")
     implementer_template = _read(config.prompts_directory / "implementer.md")
@@ -218,6 +286,7 @@ def run_implementation_workflow(
                 LATEST_REVIEW=latest_review,
                 VERIFICATION_RESULTS=latest_verification,
             )
+            implementer_prompt = f"{implementer_prompt.rstrip()}\n\n{stage_context}\n"
             implementer_output = run_directory / f"implementer-{round_number:02d}.json"
             try:
                 implementation_result = run_codex_write_structured(
@@ -287,6 +356,7 @@ def run_implementation_workflow(
             CURRENT_DIFF=diff or "No tracked diff is available. Inspect files from git status.",
             VERIFICATION_RESULTS=latest_verification,
         )
+        reviewer_prompt = f"{reviewer_prompt.rstrip()}\n\n{stage_context}\n"
         try:
             review = run_claude_structured(
                 prompt=reviewer_prompt,
@@ -332,32 +402,81 @@ def run_implementation_workflow(
             latest_review = _verification_failure_review(verification)
 
     _assert_head_unchanged(config.project_root, base_head)
-    _write_json(
-        run_directory / "result.json",
-        {
-            "status": final_status,
-            "rounds": rounds_completed,
-            "base_head": base_head,
-            "task_path": str(resolved_task),
-            "runtimes": {
-                "implementer": {
-                    "agent": config.agents.implementer,
-                    "model": config.models.implementer,
-                    "effort": config.effort.implementer,
-                },
-                "code_reviewer": {
-                    "agent": config.agents.code_reviewer,
-                    "model": config.models.code_reviewer,
-                    "effort": config.effort.code_reviewer,
-                },
+    result_payload: dict[str, object] = {
+        "status": final_status,
+        "rounds": rounds_completed,
+        "base_head": base_head,
+        "task_path": str(resolved_task),
+        "runtimes": {
+            "implementer": {
+                "agent": config.agents.implementer,
+                "model": config.models.implementer,
+                "effort": config.effort.implementer,
+            },
+            "code_reviewer": {
+                "agent": config.agents.code_reviewer,
+                "model": config.models.code_reviewer,
+                "effort": config.effort.code_reviewer,
             },
         },
-    )
+    }
+    if selected_stage is not None:
+        result_payload.update(
+            {
+                "stage_id": selected_stage.stage_id,
+                "stage_number": selected_stage.index,
+                "stage_total": len(stages),
+            }
+        )
+    _write_json(run_directory / "result.json", result_payload)
+    if selected_stage is not None:
+        record_stage_outcome(
+            state_directory=config.state_directory,
+            task_path=resolved_task,
+            stages=stages,
+            stage=selected_stage,
+            outcome_status=final_status,
+            run_directory=run_directory,
+            base_head=base_head,
+        )
     return ImplementationOutcome(
         status=final_status,
         rounds=rounds_completed,
         run_directory=run_directory,
+        stage_id=selected_stage.stage_id if selected_stage is not None else None,
     )
+
+
+def _stage_execution_context(
+    *,
+    selected_stage: Optional[TaskStage],
+    stages: tuple[TaskStage, ...],
+    completed_stages: str,
+) -> str:
+    if selected_stage is None:
+        return (
+            "## Harness execution scope\n\n"
+            "This is an atomic task without implementation stages. Implement and review "
+            "the full approved task."
+        )
+    return f"""
+## Harness execution scope
+
+This run implements exactly one stage: `{selected_stage.stage_id}`
+(stage {selected_stage.index} of {len(stages)}).
+
+### Current stage
+
+{selected_stage.markdown}
+
+### Completed stages
+
+{completed_stages}
+
+Implement and review only the current stage. Requirements belonging exclusively
+to pending stages are out of scope. Preserve behavior delivered by completed
+stages and flag any regression. Do not pre-implement later stages.
+""".strip()
 
 
 def _runtime_label(model: object, effort: object) -> str:
@@ -443,6 +562,8 @@ def _require_clean_worktree(project_root: Path, task_path: Path) -> None:
     for line in output.splitlines():
         path_text = line[3:].strip()
         if allowed_task is not None and path_text == allowed_task:
+            continue
+        if path_text.startswith(".dual-agent-task/state/"):
             continue
         disallowed.append(line)
     if disallowed:
@@ -531,4 +652,16 @@ def _write_json(path: Path, value: dict[str, object]) -> None:
         json.dumps(value, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+
+
+def _read_optional_json(path: Path) -> Optional[dict[str, object]]:
+    if not path.is_file():
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise HarnessError(f"Cannot read {path}: {error}") from error
+    if not isinstance(value, dict):
+        raise HarnessError(f"Expected a JSON object in {path}")
+    return value
 

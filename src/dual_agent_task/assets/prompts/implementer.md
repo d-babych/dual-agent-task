@@ -8,6 +8,9 @@ the change focused. Inspect existing architecture before editing. Add or update
 tests in proportion to the change. The harness runs final deterministic checks;
 you may run focused checks while implementing.
 
+The harness may append a stage execution scope. If present, implement only that
+stage and do not pre-implement pending stages.
+
 ## Project rules
 
 {{PROJECT_RULES}}

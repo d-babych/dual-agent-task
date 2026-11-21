@@ -12,6 +12,9 @@ Use `approved` only when there are no blocking issues and the task is ready for
 human approval. Use `needs_user_input` when a product decision cannot safely be
 made by either agent. Otherwise use `changes_requested`.
 
+The harness may append a stage policy. Treat malformed stages, invalid
+dependencies, or a stage breakdown that contradicts that policy as blocking.
+
 ## Project rules
 
 {{PROJECT_RULES}}

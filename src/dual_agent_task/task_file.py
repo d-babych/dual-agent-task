@@ -5,6 +5,7 @@ import json
 import re
 
 from dual_agent_task.errors import HarnessError
+from dual_agent_task.stages import parse_task_stages
 
 
 STATUS_PATTERN = re.compile(r"(?m)^status:\s*([a-z_]+)\s*$")
@@ -45,6 +46,7 @@ def approve_task(path: Path) -> None:
         raise HarnessError(
             f"Task must be ready_for_human before approval; current status is {current}"
         )
+    parse_task_stages(content)
     updated = STATUS_PATTERN.sub("status: approved", content, count=1)
     task_path.write_text(updated, encoding="utf-8")
 
@@ -76,16 +78,17 @@ def adopt_approved_task(
     if not original:
         raise HarnessError(f"Source task is empty: {source_path}")
 
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(
+    rendered = (
         "---\n"
         f"id: {task_slug}\n"
         "status: approved\n"
         f"source: {json.dumps(source_label, ensure_ascii=False)}\n"
         "---\n\n"
-        f"{original}\n",
-        encoding="utf-8",
+        f"{original}\n"
     )
+    parse_task_stages(rendered)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(rendered, encoding="utf-8")
     return target
 
 

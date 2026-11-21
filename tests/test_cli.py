@@ -27,6 +27,21 @@ class CliTests(unittest.TestCase):
             "plain",
         )
 
+    def test_stage_planning_modes_and_implementation_selector(self) -> None:
+        parser = build_parser()
+
+        self.assertEqual(parser.parse_args(("plan",)).stages, "auto")
+        self.assertEqual(
+            parser.parse_args(("plan", "--stages", "required")).stages,
+            "required",
+        )
+        self.assertEqual(parser.parse_args(("plan", "--staged")).stages, "required")
+        self.assertEqual(parser.parse_args(("plan", "--no-stages")).stages, "disabled")
+        self.assertEqual(
+            parser.parse_args(("implement", "--stage", "next", "task.md")).stage,
+            "next",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -82,6 +82,10 @@ class HarnessConfig:
     def runs_directory(self) -> Path:
         return self.harness_directory / "runs"
 
+    @property
+    def state_directory(self) -> Path:
+        return self.harness_directory / "state"
+
     @classmethod
     def load(cls, project_root: Path) -> "HarnessConfig":
         root = project_root.expanduser().resolve()
